@@ -1,3 +1,4 @@
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import torch
 
 import flashinfer
 from flashinfer.jit import core, cpp_ext
+from flashinfer.jit.attention.fmha_v2 import generator_utils
 from flashinfer.jit.attention import modules as attention_modules
 from flashinfer.utils import (
     PosEncodingMode,
@@ -13,6 +15,143 @@ from flashinfer.utils import (
     is_fa3_prefill_head_dim_supported,
 )
 from tests.test_helpers import jit_utils
+
+
+def test_fmha_v2_host_helper_preserves_native_environment_by_default(
+    monkeypatch, tmp_path
+):
+    target_vars = {
+        "CC": "/usr/bin/aarch64-linux-gnu-gcc",
+        "CXX": "/usr/bin/aarch64-linux-gnu-g++",
+        "LIBRARY_PATH": "/opt/sbsa/lib",
+        "FLASHINFER_EXTRA_LDFLAGS": "-L/opt/sbsa/lib",
+        "NVCC_PREPEND_FLAGS": "-target-dir sbsa-linux",
+    }
+    for name, value in target_vars.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("FLASHINFER_FMHA_V2_HOST_BUILD", raising=False)
+    monkeypatch.delenv("FLASHINFER_FMHA_V2_HOST_NVCC", raising=False)
+    monkeypatch.setenv("CUDA_PATH", str(tmp_path))
+
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append((command, kwargs))
+        if command == "bin/print_traits.exe":
+            return subprocess.CompletedProcess(command, 0, "traits\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(generator_utils.subprocess, "run", fake_run)
+    monkeypatch.setattr(generator_utils, "get_kernel_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_api_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_makefile_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_kernel_traits_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_cubin_header", lambda *_args: "")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "generated").mkdir()
+
+    generator_utils.generate_files([])
+
+    assert commands[0][0][0] == str(tmp_path / "bin" / "nvcc")
+    assert commands[0][1]["env"] == dict(os.environ)
+    assert commands[1][1]["env"] == commands[0][1]["env"]
+    assert all(command[1]["check"] is True for command in commands)
+    assert commands[1][1]["stdout"] is subprocess.PIPE
+    assert commands[1][1]["text"] is True
+
+
+def test_fmha_v2_host_helper_isolates_target_environment_and_uses_host_overrides(
+    monkeypatch, tmp_path
+):
+    target_vars = {
+        "CC": "/usr/bin/aarch64-linux-gnu-gcc",
+        "CXX": "/usr/bin/aarch64-linux-gnu-g++",
+        "LIBRARY_PATH": "/opt/sbsa/lib",
+        "FLASHINFER_EXTRA_LDFLAGS": "-L/opt/sbsa/lib",
+        "NVCC_PREPEND_FLAGS": "-target-dir sbsa-linux",
+    }
+    for name, value in target_vars.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("FLASHINFER_FMHA_V2_HOST_BUILD", "1")
+    monkeypatch.delenv("FLASHINFER_FMHA_V2_HOST_NVCC", raising=False)
+    monkeypatch.setenv("CUDA_PATH", str(tmp_path))
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append((command, kwargs))
+        if command == "bin/print_traits.exe":
+            return subprocess.CompletedProcess(command, 0, "traits\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(generator_utils.subprocess, "run", fake_run)
+    monkeypatch.setattr(generator_utils, "get_kernel_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_api_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_makefile_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_kernel_traits_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_cubin_header", lambda *_args: "")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "generated").mkdir()
+
+    generator_utils.generate_files([])
+
+    assert not target_vars.keys() & commands[0][1]["env"].keys()
+    assert "-ccbin" not in commands[0][0]
+    assert commands[1][1]["env"] == commands[0][1]["env"]
+
+    host_vars = {
+        "FLASHINFER_FMHA_V2_HOST_CXX": "/usr/bin/g++",
+        "FLASHINFER_FMHA_V2_HOST_LIBRARY_PATH": "/usr/lib",
+        "FLASHINFER_FMHA_V2_HOST_EXTRA_LDFLAGS": "-L/usr/lib",
+        "FLASHINFER_FMHA_V2_HOST_NVCC_PREPEND_FLAGS": "--verbose",
+    }
+    for name, value in host_vars.items():
+        monkeypatch.setenv(name, value)
+
+    commands.clear()
+    generator_utils.generate_files([])
+
+    assert commands[0][0][1:3] == ["-ccbin", "/usr/bin/g++"]
+    host_env = commands[0][1]["env"]
+    assert host_env["LIBRARY_PATH"] == "/usr/lib"
+    assert host_env["FLASHINFER_EXTRA_LDFLAGS"] == "-L/usr/lib"
+    assert host_env["NVCC_PREPEND_FLAGS"] == "--verbose"
+    assert commands[1][1]["env"] == host_env
+    assert all(command[1]["check"] is True for command in commands)
+    assert commands[1][1]["stdout"] is subprocess.PIPE
+    assert commands[1][1]["text"] is True
+
+
+def test_fmha_v2_host_helper_keeps_launcher_prefix_before_ccbin(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLASHINFER_FMHA_V2_HOST_BUILD", "1")
+    monkeypatch.setenv("FLASHINFER_FMHA_V2_HOST_NVCC", "sccache nvcc")
+    monkeypatch.setenv("FLASHINFER_FMHA_V2_HOST_CXX", "/usr/bin/g++")
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append((command, kwargs))
+        if command == "bin/print_traits.exe":
+            return subprocess.CompletedProcess(command, 0, "traits\n")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(generator_utils.subprocess, "run", fake_run)
+    monkeypatch.setattr(generator_utils, "get_kernel_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_api_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_makefile_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_kernel_traits_code", lambda *_args: "")
+    monkeypatch.setattr(generator_utils, "get_cubin_header", lambda *_args: "")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "generated").mkdir()
+
+    generator_utils.generate_files([])
+
+    assert commands[0][0][:4] == ["sccache", "nvcc", "-ccbin", "/usr/bin/g++"]
+    assert commands[1][0] == "bin/print_traits.exe"
+    assert all(command[1]["check"] is True for command in commands)
+    assert commands[1][1]["stdout"] is subprocess.PIPE
+    assert commands[1][1]["text"] is True
 
 
 def test_nvcc_parallelism_flags_use_flashinfer_nvcc_threads(monkeypatch):
