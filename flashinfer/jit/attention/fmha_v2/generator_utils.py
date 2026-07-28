@@ -10,6 +10,7 @@
 
 import logging
 import os
+import shlex
 import subprocess
 from collections import namedtuple
 from enum import IntEnum
@@ -3763,8 +3764,33 @@ def generate_files(specs_names: list[tuple[kernel_spec, str, str, str]]) -> None
     # Make sure we have a bin directory.
     if not os.path.exists("bin"):
         os.mkdir("bin")
-    cmd = [
-        "nvcc",
+    host_build = os.environ.get("FLASHINFER_FMHA_V2_HOST_BUILD", "0").lower()
+    host_build = host_build in ("1", "true", "yes", "on")
+    host_env = os.environ.copy()
+    host_cxx = None
+    if host_build:
+        host_cxx = os.environ.get("FLASHINFER_FMHA_V2_HOST_CXX")
+        for target_var in (
+            "CC",
+            "CXX",
+            "LIBRARY_PATH",
+            "FLASHINFER_EXTRA_LDFLAGS",
+            "NVCC_PREPEND_FLAGS",
+        ):
+            host_env.pop(target_var, None)
+        host_env_overrides = {
+            "LIBRARY_PATH": "FLASHINFER_FMHA_V2_HOST_LIBRARY_PATH",
+            "FLASHINFER_EXTRA_LDFLAGS": "FLASHINFER_FMHA_V2_HOST_EXTRA_LDFLAGS",
+            "NVCC_PREPEND_FLAGS": "FLASHINFER_FMHA_V2_HOST_NVCC_PREPEND_FLAGS",
+        }
+        for target_var, host_var in host_env_overrides.items():
+            if host_var in os.environ:
+                host_env[target_var] = os.environ[host_var]
+
+    nvcc_prefix = shlex.split(
+        os.environ.get("FLASHINFER_FMHA_V2_HOST_NVCC", "nvcc")
+    )
+    nvcc_args = [
         "-I",
         "src",
         "-Xcompiler",
@@ -3774,17 +3800,22 @@ def generate_files(specs_names: list[tuple[kernel_spec, str, str, str]]) -> None
         "bin/print_traits.exe",
         "generated/print_kernel_traits.cu",
     ]
-    if "CUDA_PATH" in os.environ:
+    if host_cxx:
+        nvcc_args[0:0] = ["-ccbin", host_cxx]
+    cmd = [*nvcc_prefix, *nvcc_args]
+    if "CUDA_PATH" in os.environ and "FLASHINFER_FMHA_V2_HOST_NVCC" not in os.environ:
         cmd[0] = os.environ["CUDA_PATH"] + "/bin/" + cmd[0]
     # print('Running command "{}" to build "bin/print_traits.exe":'.format(" ".join(cmd)))
-    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    output, error = process.communicate()
+    subprocess.run(cmd, check=True, env=host_env)
     # print('Running "bin/print_traits.exe":')
-    process = subprocess.Popen(
-        "bin/print_traits.exe", stdin=subprocess.PIPE, stdout=subprocess.PIPE
+    process = subprocess.run(
+        "bin/print_traits.exe",
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=host_env,
     )
-    output, error = process.communicate()
-    output_str = output.decode("utf-8").strip()
+    output_str = process.stdout.strip()
     # this gives: kname, smem bytes, threads_per_cta, loop_step
     kernel_traits = [traits.split() for traits in output_str.splitlines()]
     cubin_header = get_cubin_header(kernel_traits, valid_specs_names)
