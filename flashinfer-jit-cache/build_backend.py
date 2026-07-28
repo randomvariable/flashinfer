@@ -176,6 +176,10 @@ class PlatformSpecificBdistWheel(bdist_wheel):
         abi_tag = "abi3"  # Stable ABI tag
 
         # Get platform tag
+        platform_override = os.environ.get("FLASHINFER_WHEEL_PLATFORM_TAG")
+        if platform_override:
+            return python_tag, abi_tag, platform_override
+
         machine = platform.machine()
         if platform.system() == "Linux":
             # Use manylinux_2_28 as specified
