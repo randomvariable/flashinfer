@@ -22,8 +22,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
 import requests  # type: ignore[import-untyped]
-import shutil
 
+import shutil
 # Create logger for artifacts module to avoid circular import with jit.core
 logger = logging.getLogger("flashinfer.artifacts")
 logger.setLevel(os.getenv("FLASHINFER_LOGGING_LEVEL", "INFO").upper())
@@ -233,15 +233,17 @@ def get_checksums(subdirs):
             FLASHINFER_CUBINS_REPOSITORY, safe_urljoin(subdir, "checksums.txt")
         )
         checksum_path = FLASHINFER_CUBIN_DIR / safe_urljoin(subdir, "checksums.txt")
-        if not download_file(uri, checksum_path) and not checksum_path.is_file():
-            # Without this the next open() fails with a bare FileNotFoundError on
-            # the local cache path, which hides the real cause: the artifact pin
-            # is unreachable (typo'd/unpublished pin, or network/mirror failure).
-            raise RuntimeError(
-                f"Failed to fetch the checksum manifest for artifact pin '{subdir}' "
-                f"from {uri}. Check that the pin exists in "
-                f"{FLASHINFER_CUBINS_REPOSITORY} and is reachable."
-            )
+        if not checksum_path.is_file():
+            checksum_path.parent.mkdir(parents=True, exist_ok=True)
+            if not download_file(uri, str(checksum_path)):
+                # Without this the next open() fails with a bare FileNotFoundError on
+                # the local cache path, which hides the real cause: the artifact pin
+                # is unreachable (typo'd/unpublished pin, or network/mirror failure).
+                raise RuntimeError(
+                    f"Failed to fetch the checksum manifest for artifact pin '{subdir}' "
+                    f"from {uri}. Check that the pin exists in "
+                    f"{FLASHINFER_CUBINS_REPOSITORY} and is reachable."
+                )
         with open(checksum_path, "r") as f:
             for line in f:
                 sha256, filename = line.strip().split()
@@ -337,42 +339,43 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
             full_path = safe_urljoin(cubin_dir, name)
             yield (full_path, checksums[full_path])
 
-
 def download_artifacts() -> None:
+    """Download missing or invalid cubins while preserving valid cache entries."""
     from tqdm.contrib.logging import tqdm_logging_redirect
-
-    # use a shared session to make use of HTTP keep-alive and reuse of
-    # HTTPS connections.
     session = requests.Session()
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
-    num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
-    with tqdm_logging_redirect(
-        total=len(cubin_files), desc="Downloading cubins"
-    ) as pbar:
+    files_to_download = []
+    for name, checksum in cubin_files:
+        local_path = FLASHINFER_CUBIN_DIR / name
+        if not local_path.is_file() or not verify_cubin(str(local_path), checksum):
+            files_to_download.append((name, checksum))
 
-        def update_pbar_cb(_) -> None:
-            pbar.update(1)
+    if files_to_download:
+        num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
+        with tqdm_logging_redirect(
+            total=len(files_to_download), desc="Downloading cubins"
+        ) as pbar:
 
-        with ThreadPoolExecutor(num_threads) as pool:
-            futures = []
-            for name, _ in cubin_files:
-                source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
-                local_path = FLASHINFER_CUBIN_DIR / name
-                # Ensure parent directory exists
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                fut = pool.submit(
-                    download_file, source, str(local_path), session=session
-                )
-                fut.add_done_callback(update_pbar_cb)
-                futures.append(fut)
+            def update_pbar_cb(_) -> None:
+                pbar.update(1)
 
-            results = [fut.result() for fut in as_completed(futures)]
+            with ThreadPoolExecutor(num_threads) as pool:
+                futures = []
+                for name, _ in files_to_download:
+                    source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
+                    local_path = FLASHINFER_CUBIN_DIR / name
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    fut = pool.submit(
+                        download_file, source, str(local_path), session=session
+                    )
+                    fut.add_done_callback(update_pbar_cb)
+                    futures.append(fut)
 
-    all_success = all(results)
-    if not all_success:
-        raise RuntimeError("Failed to download cubins")
+                results = [fut.result() for fut in as_completed(futures)]
 
-    # Check checksums of all downloaded cubins
+        if not all(results):
+            raise RuntimeError("Failed to download cubins")
+
     for name, checksum in cubin_files:
         local_path = FLASHINFER_CUBIN_DIR / name
         if not verify_cubin(str(local_path), checksum):

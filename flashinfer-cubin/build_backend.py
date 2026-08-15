@@ -17,28 +17,34 @@ os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 
 def _download_cubins():
-    """Download cubins to the source directory before building."""
-    from flashinfer.artifacts import download_artifacts
+    """Download cubins into the package, reusing the persistent cache."""
+    import shutil
 
-    # Create cubins directory in the source tree
-    cubin_dir = Path(__file__).parent / "flashinfer_cubin" / "cubins"
-    cubin_dir.mkdir(parents=True, exist_ok=True)
+    package_cubin_dir = Path(__file__).parent / "flashinfer_cubin" / "cubins"
+    cache_cubin_dir = Path(
+        os.environ.get(
+            "FLASHINFER_CUBIN_BUILD_CACHE", "/root/.cache/flashinfer/cubins"
+        )
+    )
 
-    # Set environment variable to download to our package directory
+    package_cubin_dir.mkdir(parents=True, exist_ok=True)
+    cache_cubin_dir.mkdir(parents=True, exist_ok=True)
+
     original_cubin_dir = os.environ.get("FLASHINFER_CUBIN_DIR")
-    os.environ["FLASHINFER_CUBIN_DIR"] = str(cubin_dir)
+    os.environ["FLASHINFER_CUBIN_DIR"] = str(cache_cubin_dir)
 
     try:
-        print(f"Downloading cubins to {cubin_dir}...")
+        from flashinfer.artifacts import download_artifacts
+
+        print(f"Downloading cubins to cache {cache_cubin_dir}...")
         download_artifacts()
-        print(f"Successfully downloaded cubins to {cubin_dir}")
-
-        # Count the downloaded files
-        cubin_files = list(cubin_dir.rglob("*.cubin"))
-        print(f"Downloaded {len(cubin_files)} cubin files")
-
+        print(f"Successfully updated cubin cache {cache_cubin_dir}")
+        if package_cubin_dir.exists():
+            shutil.rmtree(package_cubin_dir)
+        shutil.copytree(cache_cubin_dir, package_cubin_dir)
+        cubin_files = list(package_cubin_dir.rglob("*.cubin"))
+        print(f"Packaged {len(cubin_files)} cubin files")
     finally:
-        # Restore original environment variable
         if original_cubin_dir:
             os.environ["FLASHINFER_CUBIN_DIR"] = original_cubin_dir
         else:
