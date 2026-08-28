@@ -1,4 +1,34 @@
 import contextlib
+import threading
+
+
+_tuning_context = threading.local()
+
+
+def set_tuning_context(label: str) -> None:
+    """Set a human-readable label shown alongside autotuner progress.
+
+    Callers that know which model component is being tuned (e.g. a vLLM
+    MoE layer such as ``model.layers.5.mlp.experts``) can wrap their
+    tuning session with this so progress lines answer "which layer is
+    this?" without reading stack traces.
+    """
+    _tuning_context.label = label
+
+
+def get_tuning_context() -> str:
+    return getattr(_tuning_context, "label", "") or ""
+
+
+@contextlib.contextmanager
+def tuning_context(label: str):
+    set_tuning_context(label)
+    try:
+        yield
+    finally:
+        _tuning_context.label = ""
+
+
 import copy
 import functools
 import hashlib
@@ -1764,7 +1794,14 @@ class AutoTuner:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
                                 initial=_step,
-                                desc=f"[AutoTuner]: Tuning {custom_op}",
+                                desc=(
+                                    f"[AutoTuner]: Tuning {custom_op}"
+                                    + (
+                                        f" ({ctx})"
+                                        if (ctx := get_tuning_context())
+                                        else ""
+                                    )
+                                ),
                                 unit="profile",
                                 leave=True,
                             )
