@@ -1,0 +1,18 @@
+flashinfer/experimental/b12x/gemm/bf16_vocab_projection/_preparation.py
+  h_15da545fc8cfbe 30-47,128-130
+flashinfer/experimental/b12x/gemm/bf16_vocab_projection/_tuning.py
+  h_15da545fc8cfbe 12,17-21,24,93,95-101,103-105,137-145,169-172,179-191,197,206,209-211,215,241,243
+tests/experimental/b12x/gemm/test_bf16_vocab_projection.py
+  h_15da545fc8cfbe 34,43,45-52,54-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9e8a9fb37e1e65c5962997757d965110eaf5e675",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
