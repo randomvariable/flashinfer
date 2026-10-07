@@ -9,13 +9,19 @@ from b12x.preparation import (
     FrozenMapping,
     Knob,
     ParameterBinding,
+    ParameterSpace,
     TuningContract,
 )
 
 MAX_IN_FEATURES = 8_192
-MIN_TRITON_OUT_FEATURES = 16_384
+MIN_NATIVE_OUT_FEATURES = 16_384
+# Rows one bf16_gemv SIMT tile serves from a single weight read (its SMALL_M_MAX).
+# The Triton row kernels stream the weight once per row, so beyond one row the
+# CuTe kernel is the only native choice that keeps the projection bandwidth-bound.
+MAX_CUTE_TOKENS = 8
 _TRITON_WARPS = frozenset((1, 2, 4, 8))
 _LOOP_BLOCKS = frozenset((256, 512, 1_024))
+_ALGORITHMS = {"torch": ("torch",), "triton": ("row", "loop"), "cute": ("simt",)}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -79,16 +85,20 @@ def _default_config(
     if (
         supported_device
         and query.dtype == "bfloat16"
-        and query.max_tokens == 1
         and 0 < query.in_features <= MAX_IN_FEATURES
-        and query.out_features >= MIN_TRITON_OUT_FEATURES
+        and query.out_features >= MIN_NATIVE_OUT_FEATURES
     ):
-        return Bf16VocabProjectionConfig(
-            backend="triton",
-            algorithm="row",
-            block_k=_next_power_of_two(query.in_features),
-            num_warps=8,
-        )
+        if query.max_tokens == 1:
+            return Bf16VocabProjectionConfig(
+                backend="triton",
+                algorithm="row",
+                block_k=_next_power_of_two(query.in_features),
+                num_warps=8,
+            )
+        if query.max_tokens <= MAX_CUTE_TOKENS:
+            return Bf16VocabProjectionConfig(
+                backend="cute", algorithm="simt", block_k=0, num_warps=0
+            )
     return Bf16VocabProjectionConfig(
         backend="torch",
         algorithm="torch",
@@ -120,7 +130,15 @@ def _validate_config(
         raise TypeError("config must be Bf16VocabProjectionConfig")
     if config.backend == "torch":
         if (config.algorithm, config.block_k, config.num_warps) != ("torch", 0, 0):
-            raise ValueError("torch projection configs cannot carry Triton knobs")
+            raise ValueError("torch projection configs cannot carry native knobs")
+        return
+    if config.backend == "cute":
+        if (config.algorithm, config.block_k, config.num_warps) != ("simt", 0, 0):
+            raise ValueError("CuTe projection configs select only the SIMT GEMV")
+        if query.max_tokens > MAX_CUTE_TOKENS:
+            raise ValueError(
+                f"the CuTe vocabulary GEMV supports max_tokens <= {MAX_CUTE_TOKENS}"
+            )
         return
     if config.backend != "triton":
         raise ValueError(f"unsupported projection backend {config.backend!r}")
@@ -144,24 +162,35 @@ def _validate_config(
         raise ValueError(f"unsupported Triton algorithm {config.algorithm!r}")
 
 
+def _paired_algorithm(choice) -> bool:
+    return choice["algorithm"] in _ALGORITHMS[choice["backend"]]
+
+
 def _tuning_parameters(query, device):
     row_blocks = tuple(
         1 << exponent
         for exponent in range(MAX_IN_FEATURES.bit_length())
         if 1 << exponent >= query.in_features
     )
-    return {
-        "backend": ("torch", "triton")
-        if query.max_tokens == 1 and query.in_features <= MAX_IN_FEATURES
-        else ("torch",),
-        "block_k": tuple(sorted(set(row_blocks) | _LOOP_BLOCKS)),
-    }
+    backends = ["torch"]
+    if query.max_tokens == 1 and query.in_features <= MAX_IN_FEATURES:
+        backends.append("triton")
+    if query.max_tokens <= MAX_CUTE_TOKENS:
+        backends.append("cute")
+    return ParameterSpace.create(
+        TUNING.knobs,
+        values={
+            "backend": tuple(backends),
+            "block_k": tuple(sorted(set(row_blocks) | _LOOP_BLOCKS)),
+        },
+        predicates=(_paired_algorithm,),
+    )
 
 
 TUNING = TuningContract(
     component_id="gemm.bf16_vocab_projection",
     query_schema_version=1,
-    config_schema_version=1,
+    config_schema_version=2,
     query_fields=frozenset(Bf16VocabProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(Bf16VocabProjectionConfig.__dataclass_fields__),
     encode_query=_encode,
@@ -170,17 +199,17 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=2,
+    candidate_contract_version=3,
     knobs=(
         Knob(
-            name="backend", values=("torch", "triton"), binding=ParameterBinding.COMPILE
+            name="backend",
+            values=("torch", "triton", "cute"),
+            binding=ParameterBinding.COMPILE,
         ),
         Knob(
             name="algorithm",
-            values=("row", "loop"),
+            values=("torch", "row", "loop", "simt"),
             binding=ParameterBinding.COMPILE,
-            when=FrozenMapping({"backend": "triton"}),
-            otherwise="torch",
         ),
         Knob(
             name="block_k",
@@ -205,6 +234,7 @@ __all__ = [
     "TUNING",
     "Bf16VocabProjectionConfig",
     "Bf16VocabProjectionQuery",
+    "MAX_CUTE_TOKENS",
     "MAX_IN_FEATURES",
-    "MIN_TRITON_OUT_FEATURES",
+    "MIN_NATIVE_OUT_FEATURES",
 ]

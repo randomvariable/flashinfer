@@ -27,6 +27,24 @@ def compile_vocab_projection(query_payload, config_payload, ordinal):
     TUNING.validate_config(query, config, None)
     if config.backend == "torch":
         return {}
+    if config.backend == "cute":
+        from b12x.gemm.bf16_gemv._kernel import SMALL_M_MAX, compile_projection
+
+        if query.max_tokens > SMALL_M_MAX:
+            raise ValueError("CuTe vocabulary projection exceeds one SIMT row tile")
+        return {
+            "projection": compile_projection(
+                ordinal,
+                "simt",
+                SMALL_M_MAX,
+                query.out_features,
+                query.in_features,
+                "bfloat16",
+                "bfloat16",
+                "bfloat16",
+                None,
+            )
+        }
     kernel = (
         _kernel._row_kernel if config.algorithm == "row" else _kernel._row_loop_kernel
     )
@@ -107,6 +125,9 @@ def make_plan(caps: Caps, *, invocation=FrozenMapping(), override=None) -> Plan:
                     dtype=torch.bfloat16,
                     device=source.device,
                 )
+                if config.backend == "cute":
+                    launcher(source, weight, output, None)
+                    return output
                 launcher[(query.out_features, rows, 1)](
                     source,
                     weight,
