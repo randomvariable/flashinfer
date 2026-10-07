@@ -1,0 +1,16 @@
+flashinfer-cubin/build_backend.py
+  h_15da545fc8cfbe 20-21,23-31,34,37,39-46
+flashinfer/artifacts.py
+  h_15da545fc8cfbe 26,236-246,343,347-377
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "95add39c178d92f9e3e8638e9aa57317f9cabd60",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
