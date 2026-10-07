@@ -22,6 +22,11 @@ MAX_CUTE_TOKENS = 8
 _TRITON_WARPS = frozenset((1, 2, 4, 8))
 _LOOP_BLOCKS = frozenset((256, 512, 1_024))
 _ALGORITHMS = {"torch": ("torch",), "triton": ("row", "loop"), "cute": ("simt",)}
+# Largest row capacity whose default is the CuTe SIMT GEMV, from graph-replay
+# timings of a 248320x2560 head. GB10 (12, 1): SIMT beats cuBLAS at 2..8 rows.
+# RTX 5090 (12, 0): SIMT wins at 2 rows, ties at 4 and loses at 8, so wider
+# capacities keep cuBLAS unless autotuning measures otherwise.
+_DEFAULT_CUTE_TOKENS = {(12, 0): 2, (12, 1): MAX_CUTE_TOKENS}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -78,12 +83,11 @@ def _default_config(
     query: Bf16VocabProjectionQuery,
     device: DeviceIdentity | None,
 ) -> Bf16VocabProjectionConfig:
-    supported_device = device is not None and device.compute_capability in {
-        (12, 0),
-        (12, 1),
-    }
+    cute_tokens = (
+        0 if device is None else _DEFAULT_CUTE_TOKENS.get(device.compute_capability, 0)
+    )
     if (
-        supported_device
+        cute_tokens
         and query.dtype == "bfloat16"
         and 0 < query.in_features <= MAX_IN_FEATURES
         and query.out_features >= MIN_NATIVE_OUT_FEATURES
@@ -95,7 +99,7 @@ def _default_config(
                 block_k=_next_power_of_two(query.in_features),
                 num_warps=8,
             )
-        if query.max_tokens <= MAX_CUTE_TOKENS:
+        if query.max_tokens <= cute_tokens:
             return Bf16VocabProjectionConfig(
                 backend="cute", algorithm="simt", block_k=0, num_warps=0
             )

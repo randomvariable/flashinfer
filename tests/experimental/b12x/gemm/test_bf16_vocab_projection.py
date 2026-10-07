@@ -32,12 +32,16 @@ def test_unknown_device_default_uses_selected_torch_backend() -> None:
 
 
 @pytest.mark.parametrize(
-    ("max_tokens", "backend"),
-    [(1, "triton"), (4, "cute"), (8, "cute"), (9, "torch")],
+    ("capability", "max_tokens", "backend"),
+    [
+        ((12, 1), 1, "triton"),
+        ((12, 1), 8, "cute"),
+        ((12, 1), 9, "torch"),
+        ((12, 0), 2, "cute"),
+        ((12, 0), 4, "torch"),
+    ],
 )
-def test_sm12x_default_backend_by_row_capacity(max_tokens, backend) -> None:
-    # One row streams the weight once on either native kernel; more rows must
-    # share one weight read, which only the CuTe SIMT tile does, up to 8 rows.
+def test_sm12x_default_backend_by_row_capacity(capability, max_tokens, backend) -> None:
     query = projection.Bf16VocabProjectionQuery(
         dtype="bfloat16",
         max_tokens=max_tokens,
@@ -46,7 +50,7 @@ def test_sm12x_default_backend_by_row_capacity(max_tokens, backend) -> None:
     )
     device = DeviceIdentity(
         vendor="nvidia",
-        compute_capability=(12, 1),
+        compute_capability=capability,
         sm_count=48,
         product_name="Synthetic GPU",
     )
