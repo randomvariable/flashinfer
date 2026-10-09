@@ -7,7 +7,10 @@ qualify cuFile. A selected but unavailable transport fails instead of skipping.
 from __future__ import annotations
 
 import os
+import threading
+import time
 
+import numpy as np
 import pytest
 import torch
 
@@ -378,3 +381,256 @@ def test_cache_requires_io_uring_or_host_source(monkeypatch):
     monkeypatch.setenv("B12X_DISK_BACKEND", "gds")
     with pytest.raises(ValueError, match="GDS backend does not support a row cache"):
         _cache(cache_rows=8, cache_tier="device")
+
+
+def _host_rows(payloads):
+    """CPU uint8 host-resident shard tables over the cache's ``[7, 290)`` range."""
+    return tuple(p[7:290].contiguous() for p in payloads)
+
+
+def _fake_fetch(payloads, block=None, fail_first=0, record=None):
+    """Deterministic stand-in for the source read, independent of disk/native.
+
+    It writes ``payloads[plane][gid]`` for in-shard ids and zeros otherwise, so
+    prefetched and synchronously fetched bytes are byte-identical for a given
+    id (last write wins). ``block`` holds the worker inside the fetch so a test
+    can observe loading slots; ``fail_first`` raises for the leading calls to
+    exercise the cancel path; ``record`` collects the raw call arguments.
+    """
+    weight_src, scale_src = payloads[0].numpy(), payloads[1].numpy()
+    state = {"calls": 0}
+
+    def fetch(self, ids, weights, scales, count):
+        state["calls"] += 1
+        if record is not None:
+            record.append((ids, weights, scales, count))
+        if block is not None:
+            block.wait(timeout=5)
+        if state["calls"] <= fail_first:
+            raise IOError("injected prefetch read failure")
+        id_arr = np.frombuffer(ids, dtype=np.int64, count=count)
+        for buffer, source in ((weights, weight_src), (scales, scale_src)):
+            if buffer is None:
+                continue
+            width = source.shape[1]
+            out = np.frombuffer(buffer, dtype=np.uint8, count=count * width).reshape(
+                count, width
+            )
+            out.flags.writeable = True
+            for row, gid in enumerate(id_arr):
+                gid = int(gid)
+                out[row] = source[gid] if 7 <= gid < 290 else 0
+
+    return fetch
+
+
+def _drain(cache, ids, timeout=3.0):
+    index = cache._index
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (
+            cache._prefetch_queue.empty()
+            and all(index.is_ready(gid) for gid in ids)
+        ):
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"prefetch did not drain: {ids}")
+
+
+def _wait_loading(cache, ids, timeout=3.0):
+    index = cache._index
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cache._prefetch_queue.empty() and all(
+            gid in index._loading for gid in ids
+        ):
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"ids never entered loading: {ids}")
+
+
+def _wait_jobs(cache, record, at_least, timeout=3.0):
+    index = cache._index
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (
+            len(record) >= at_least
+            and cache._prefetch_queue.empty()
+            and not index._loading
+        ):
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"prefetch jobs did not settle (calls={len(record)})")
+
+
+def test_prefetch_disabled_returns_false(monkeypatch):
+    """Env unset / "0" and a zero-row cache never fetch and never spawn a thread."""
+    monkeypatch.delenv("B12X_PLE_PREFETCH", raising=False)
+    payloads = _payloads()
+    host_rows = _host_rows(payloads)
+    before = threading.active_count()
+    cache = _cache(cache_rows=16, cache_tier="host", host_rows=host_rows)
+    try:
+        assert cache.prefetch([7, 8, 9]) is False
+        assert cache._prefetch_thread is None
+        monkeypatch.setenv("B12X_PLE_PREFETCH", "0")
+        assert cache.prefetch([7, 8, 9]) is False
+        assert cache._prefetch_thread is None
+    finally:
+        cache.close()
+    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
+    zero = _cache(cache_rows=0, cache_tier="host", host_rows=host_rows)
+    try:
+        assert zero.prefetch([7, 8]) is False
+        assert zero._prefetch_thread is None
+    finally:
+        zero.close()
+    assert threading.active_count() == before
+
+
+@torch.inference_mode()
+def test_prefetch_ready_hits_after_drain(monkeypatch):
+    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
+    payloads = _payloads()
+    monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads))
+    cache = _cache(cache_rows=32, cache_tier="host", host_rows=_host_rows(payloads))
+    try:
+        cache.freeze()
+        ids = [7, 8, 100, 150, 200, 289]
+        assert cache.prefetch(ids) is True
+        assert cache._prefetch_thread is not None
+        _drain(cache, ids)
+        assert all(cache._index.is_ready(gid) for gid in ids)
+        with cache._lock:
+            plan = cache._index.plan(list(ids))
+        assert plan.miss_ids == []
+        assert sorted(plan.hit_pos) == list(range(len(ids)))
+        host_ids = torch.tensor(ids, dtype=torch.int64)
+        with cache.transaction():
+            cache.read_rows(host_ids.to(cache.device), len(ids))
+            for actual, source in zip((cache.weight, cache.scale), payloads):
+                torch.testing.assert_close(
+                    actual[: len(ids)].cpu(),
+                    _expected(source, host_ids),
+                    rtol=0,
+                    atol=0,
+                )
+    finally:
+        cache.close()
+
+
+@torch.inference_mode()
+def test_loading_slot_immune_to_eviction(monkeypatch):
+    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
+    payloads = _payloads()
+    gate = threading.Event()
+    monkeypatch.setattr(
+        DiskRowCache, "_fetch", _fake_fetch(payloads, block=gate)
+    )
+    cache = _cache(cache_rows=6, cache_tier="host", host_rows=_host_rows(payloads))
+    try:
+        cache.freeze()
+        loading_ids = [7, 8, 9]
+        assert cache.prefetch(loading_ids) is True
+        _wait_loading(cache, loading_ids)
+        slots = {gid: cache._index._loading[gid] for gid in loading_ids}
+        # Synchronous misses must evict committed rows, never a loading one.
+        with cache._lock:
+            plan = cache._index.plan(
+                [100, 101, 102, 103, 104, 105, 106, 107, 108]
+            )
+        assert len(plan.miss_ids) == 9
+        assert len(cache._index._slot) > 0
+        for gid in loading_ids:
+            assert gid in cache._index._loading
+            assert not cache._index.is_ready(gid)
+            assert cache._index._loading[gid] == slots[gid]
+        gate.set()
+        _drain(cache, loading_ids)
+        assert all(cache._index.is_ready(gid) for gid in loading_ids)
+    finally:
+        gate.set()
+        cache.close()
+
+
+def test_duplicate_invalid_noop(monkeypatch):
+    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
+    payloads = _payloads()
+    record = []
+    monkeypatch.setattr(
+        DiskRowCache, "_fetch", _fake_fetch(payloads, record=record)
+    )
+    cache = _cache(cache_rows=16, cache_tier="host", host_rows=_host_rows(payloads))
+    try:
+        cache.freeze()
+        request = np.array(
+            [7, 7, 8, 8, 6, 290, 300, -5, 2**40, 100], dtype=np.int64
+        )
+        assert cache.prefetch(request) is True
+        _drain(cache, [7, 8, 100])
+        assert cache._index.is_ready(7) and cache._index.is_ready(8)
+        assert cache._index.is_ready(100)
+        for bad in (6, 290, 300, -5, 2**40):
+            assert not cache._index.is_ready(bad)
+        # One job, exactly the distinct in-shard ids, fetched once each.
+        assert len(record) == 1
+        fetched = set(
+            np.frombuffer(
+                record[0][0], dtype=np.int64, count=record[0][3]
+            ).tolist()
+        )
+        assert fetched == {7, 8, 100}
+        # Re-prefetching already-ready rows is a no-op: still a single fetch.
+        assert cache.prefetch([7, 8, 100]) is True
+        assert len(record) == 1
+    finally:
+        cache.close()
+
+
+def test_close_stops_worker(monkeypatch):
+    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
+    payloads = _payloads()
+    monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads))
+    cache = _cache(cache_rows=16, cache_tier="host", host_rows=_host_rows(payloads))
+    cache.freeze()
+    assert cache.prefetch([7, 8, 9]) is True
+    worker = cache._prefetch_thread
+    assert worker is not None
+    started = time.monotonic()
+    cache.close()
+    elapsed = time.monotonic() - started
+    assert not worker.is_alive()
+    assert elapsed <= 2.5
+
+
+@torch.inference_mode()
+def test_rejected_prefetch_sync_identical(monkeypatch):
+    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
+    payloads = _payloads()
+    record = []
+    # The worker's first fetch fails; the synchronous read must still succeed.
+    monkeypatch.setattr(
+        DiskRowCache, "_fetch", _fake_fetch(payloads, fail_first=1, record=record)
+    )
+    cache = _cache(cache_rows=16, cache_tier="host", host_rows=_host_rows(payloads))
+    try:
+        cache.freeze()
+        ids = [7, 8, 100]
+        assert cache.prefetch(ids) is True
+        _wait_jobs(cache, record, 1)
+        # A rejected prefetch leaves nothing cached and nothing in flight.
+        for gid in ids:
+            assert not cache._index.is_ready(gid)
+            assert gid not in cache._index._loading
+        host_ids = torch.tensor(ids, dtype=torch.int64)
+        with cache.transaction():
+            cache.read_rows(host_ids.to(cache.device), len(ids))
+            for actual, source in zip((cache.weight, cache.scale), payloads):
+                torch.testing.assert_close(
+                    actual[: len(ids)].cpu(),
+                    _expected(source, host_ids),
+                    rtol=0,
+                    atol=0,
+                )
+    finally:
+        cache.close()

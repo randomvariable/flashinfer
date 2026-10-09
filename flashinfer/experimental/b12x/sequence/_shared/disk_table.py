@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import operator
 import os
+import queue
 import sys
 import threading
 from contextlib import contextmanager, suppress
@@ -19,6 +20,10 @@ import torch
 
 if TYPE_CHECKING:
     from cuda.bindings import runtime as cudart
+
+# Poison pill handed to the prefetch worker's queue by ``close`` to unblock and
+# stop its daemon thread. Distinct by identity from any id list a job may hold.
+_PREFETCH_SENTINEL = object()
 
 
 def _check_cuda(error: cudart.cudaError_t, operation: str) -> None:
@@ -150,6 +155,15 @@ class DiskRowCache:
     ``cache_rows``/``cache_tier`` default to ``B12X_ROW_CACHE_ROWS`` (0, off)
     and ``B12X_ROW_CACHE_TIER`` (``auto``: host on integrated GPUs, device
     otherwise). The GDS backend stages on the device itself and is not cached.
+
+    ``prefetch(ids)`` warms the cache ahead of the read path from a background
+    worker, driven by ``B12X_PLE_PREFETCH`` (off by default). Reserved rows sit
+    in a loading slot that a lookup never hits and eviction never reclaims;
+    only a confirmed row becomes a ready hit. The synchronous read path treats
+    an in-flight prefetch as a plain miss and takes its own fetch, so the same
+    row can be written by both the worker and the batch, always with identical
+    bytes (last write wins). Both the disk and ``host_rows`` sources are
+    prefetchable through the same ``_fetch`` primitive.
     """
 
     def __init__(
@@ -279,6 +293,12 @@ class DiskRowCache:
         self._cache_done = torch.cuda.Event()
         self._cache_used = False
         self._closed = False
+        # Speculative PLE row prefetch. The worker thread and its bounded queue
+        # are created lazily on the first enabled ``prefetch`` so a disabled
+        # cache never spawns a thread; both stay ``None`` until then.
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_queue: queue.Queue | None = None
+        self._prefetch_stop = False
 
     def _check_host_rows(self, host_rows):
         weight, scale = host_rows
@@ -370,6 +390,9 @@ class DiskRowCache:
                 return
             if self._transaction_thread is not None:
                 raise RuntimeError("cannot close a disk row cache during a transaction")
+            self._prefetch_stop = True
+            worker = self._prefetch_thread
+            jobs = self._prefetch_queue
             if self._cache_used:
                 with torch.cuda.device(self.device):
                     self._cache_done.synchronize()
@@ -380,6 +403,184 @@ class DiskRowCache:
                     allocation.close()
             self._reader = self._native = None
             self._closed = True
+        # Drain the worker outside the lock: a running job reacquires it in its
+        # reserve/confirm sections, so joining while holding it would deadlock.
+        if worker is not None and jobs is not None:
+            with suppress(queue.Full):
+                jobs.put_nowait(_PREFETCH_SENTINEL)
+            worker.join(timeout=2)
+
+    def prefetch(self, ids) -> bool:
+        """Speculatively fetch ``ids`` into the row cache without blocking.
+
+        Advisory only: it never touches the staging buffer, never raises, and
+        hands the work to a single lazily-started daemon worker over a bounded
+        queue, so callers are never stalled behind disk I/O. Returns ``False``
+        when the row cache is disabled (``cache_rows == 0``) or the
+        ``B12X_PLE_PREFETCH`` environment variable is unset or ``"0"``;
+        otherwise ``True``. ``ids`` may be a list of ints, a CPU int64 tensor,
+        or a numpy array; duplicate, out-of-shard, and already-handled ids are
+        no-ops. When the queue is saturated the newest request is dropped.
+        """
+        if not self._prefetch_ok():
+            return False
+        job = self._normalize_prefetch_ids(ids)
+        if not job:
+            return True
+        self._ensure_prefetch_worker()
+        if self._prefetch_queue is None:
+            return True
+        try:
+            self._prefetch_queue.put_nowait(job)
+        except queue.Full:
+            pass
+        return True
+
+    def _prefetch_ok(self) -> bool:
+        """Gate speculative prefetch: cache enabled, disk/host backend, opt-in env.
+
+        ``b12x`` has no ``vllm`` env module, so the flag is read straight from
+        ``os.environ``. It defaults to off; only a set, nonzero value turns
+        prefetch on. Returns ``False`` for a disabled cache (``cache_rows == 0``)
+        or a closed one so no worker is ever spawned for a cache that cannot
+        hold rows.
+        """
+        if self._closed or not self.cache_rows or self._index is None:
+            return False
+        if self._backend == "gds":
+            return False
+        flag = os.environ.get("B12X_PLE_PREFETCH")
+        return flag is not None and flag != "0"
+
+    def _normalize_prefetch_ids(self, ids) -> list[int]:
+        """Coerce ``ids`` to the distinct in-shard, not-yet-cached row ids.
+
+        Accepts a list of ints, a CPU int64 tensor, or a numpy array; every
+        element is converted with ``int``. Duplicates collapse to first
+        occurrence, out-of-shard ids are dropped (nothing to prefetch), and
+        ids already committed are dropped as no-ops. Rows merely loading are
+        left in: their ``reserve`` returns ``None`` in the worker, so they cost
+        a cheap no-op rather than a second fetch.
+        """
+        import numpy as np
+
+        if isinstance(ids, torch.Tensor):
+            if ids.numel() == 0:
+                return []
+            ids = ids.detach().cpu()
+            if ids.dtype != torch.int64:
+                ids = ids.to(torch.int64)
+            raw = ids.reshape(-1).tolist()
+        elif isinstance(ids, np.ndarray):
+            if ids.size == 0:
+                return []
+            raw = ids.reshape(-1).tolist()
+        else:
+            raw = list(ids)
+        low, high = self.shard_start, self.shard_end
+        index = self._index
+        seen: set[int] = set()
+        result: list[int] = []
+        with self._lock:
+            for value in raw:
+                key = int(value)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not low <= key < high:
+                    continue
+                if index.is_ready(key):
+                    continue
+                result.append(key)
+        return result
+
+    def _ensure_prefetch_worker(self) -> None:
+        with self._lock:
+            if self._prefetch_thread is not None or self._closed:
+                return
+            self._prefetch_queue = queue.Queue(maxsize=64)
+            self._prefetch_stop = False
+            worker = threading.Thread(
+                target=self._prefetch_loop,
+                name="b12x-ple-prefetch",
+                daemon=True,
+            )
+            self._prefetch_thread = worker
+        worker.start()
+
+    def _prefetch_loop(self) -> None:
+        while not self._prefetch_stop:
+            try:
+                job = self._prefetch_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if job is _PREFETCH_SENTINEL:
+                break
+            try:
+                self._run_prefetch_job(job)
+            except Exception:
+                # Prefetch is advisory: a source/transport error must never
+                # surface to, or destabilize, the caller or the worker.
+                pass
+
+    def _run_prefetch_job(self, ids) -> None:
+        import numpy as np
+
+        index = self._index
+        reserved: list[tuple[int, int]] = []
+        with self._lock:
+            if self._closed:
+                return
+            for key in ids:
+                slot = index.reserve(key)
+                if slot is not None:
+                    reserved.append((key, slot))
+        if not reserved:
+            return
+        count = len(reserved)
+        weight_np = np.zeros((count, self.weight_row_bytes), dtype=np.uint8)
+        scale_np = (
+            np.zeros((count, self.scale_row_bytes), dtype=np.uint8)
+            if self.scale_row_bytes
+            else None
+        )
+        ids_np = np.fromiter((key for key, _ in reserved), dtype=np.int64, count=count)
+        try:
+            self._fetch(
+                memoryview(ids_np),
+                memoryview(weight_np),
+                memoryview(scale_np) if scale_np is not None else None,
+                count,
+            )
+            fetched = True
+        except Exception:
+            fetched = False
+        planes = [weight_np] + ([scale_np] if scale_np is not None else [])
+        with self._lock:
+            if self._closed:
+                for _, slot in reserved:
+                    index.cancel(slot)
+                return
+            if not fetched:
+                for _, slot in reserved:
+                    index.cancel(slot)
+                return
+            if self.cache_tier == "host":
+                for row, (_, slot) in enumerate(reserved):
+                    if index._state[slot] != index._LOADING:
+                        continue
+                    for plane, pool in zip(planes, self._pool):
+                        pool[slot] = plane[row]
+            else:
+                with torch.cuda.device(self.device):
+                    for row, (_, slot) in enumerate(reserved):
+                        if index._state[slot] != index._LOADING:
+                            continue
+                        for plane, pool in zip(planes, self._pool):
+                            pool[slot].copy_(torch.from_numpy(plane[row]))
+                    torch.cuda.current_stream(self.device).synchronize()
+            for _, slot in reserved:
+                index.confirm(slot)
 
     def add_shard(
         self, shard_index: int, path: str, offset: int, *, scale: bool = False
