@@ -288,3 +288,93 @@ def test_full_batch_uses_registered_slots_above_one_mib(tmp_path):
             assert cache.stats()["read_calls"] == count
     finally:
         cache.close()
+
+
+def _payloads():
+    return [
+        (
+            torch.arange(300 * width, dtype=torch.int64) * 17
+            + torch.arange(300).repeat_interleave(width)
+        )
+        .remainder(251)
+        .to(torch.uint8)
+        .reshape(300, width)
+        for width in (257, 9)
+    ]
+
+
+def _expected(source, ids):
+    expected = torch.zeros((len(ids), source.shape[1]), dtype=torch.uint8)
+    valid = (ids >= 7) & (ids < 290)
+    expected[valid] = source[ids[valid]]
+    return expected
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("tier", ["host", "device"])
+@pytest.mark.parametrize("capacity", [1, 5, 64, 400])
+@pytest.mark.parametrize("source", ["disk", "host"])
+def test_sieve_cached_rows_match_uncached_bytes(
+    tmp_path, monkeypatch, tier, capacity, source
+):
+    """Cached staging must equal the source for repeats, in-batch duplicates,
+    invalid IDs, and capacities that evict rows the same batch still reads."""
+    monkeypatch.setenv("B12X_DISK_BACKEND", "io_uring")
+    payloads = _payloads()
+    host_rows = None
+    if source == "host":
+        host_rows = tuple(p[7:290].contiguous() for p in payloads)
+    cache = _cache(cache_rows=capacity, cache_tier=tier, host_rows=host_rows)
+    try:
+        if source == "disk":
+            for scale, data in zip((False, True), payloads):
+                for shard in range(3):
+                    path = tmp_path / f"{scale}-{shard}.bin"
+                    _write(
+                        path, data[shard * 100 : (shard + 1) * 100].numpy().tobytes(), 0
+                    )
+                    cache.add_shard(shard, str(path), 0, scale=scale)
+        cache.freeze()
+        assert (cache.weight.device.type == "cuda") and (
+            (cache.weight_host is None) == (tier == "device")
+        )
+        generator = torch.Generator().manual_seed(capacity)
+        hot = torch.tensor([7, 8, 150, 151, 289, 6, 290, 2**40])
+        for count in [40, 40, 1, 0, 17, 40, 40]:
+            ids = torch.where(
+                torch.rand(count, generator=generator) < 0.6,
+                hot[torch.randint(len(hot), (count,), generator=generator)],
+                torch.randint(0, 300, (count,), generator=generator),
+            )
+            with cache.transaction():
+                cache.read_rows(ids.to(cache.device), count)
+                for actual, data in zip((cache.weight, cache.scale), payloads):
+                    torch.testing.assert_close(
+                        actual[:count].cpu(), _expected(data, ids), rtol=0, atol=0
+                    )
+        stats = cache.stats()
+        assert stats["row_cache_tier"] == tier
+        assert 0 < stats["row_cache_resident"] <= capacity
+        assert stats["row_cache_hits"] > 0
+    finally:
+        cache.close()
+
+
+def test_sieve_keeps_visited_rows_over_newer_one_hit_rows():
+    from b12x.sequence._shared.row_cache import SieveIndex
+
+    index = SieveIndex(3)
+    index.plan([1, 2, 3])
+    index.plan([1])  # 1 visited
+    index.plan([4])  # evicts oldest unvisited (2); 1's bit is cleared on the sweep
+    assert 1 in index and 2 not in index and 3 in index and 4 in index
+    index.plan([5])  # hand continues from 3: 3 unvisited -> evicted
+    assert 1 in index and 3 not in index and 4 in index and 5 in index
+    index.plan([1, 1, 6])  # duplicates count once per position, fetch once
+    assert index.hits == 1 + 2 and 6 in index and 1 in index
+
+
+def test_cache_requires_io_uring_or_host_source(monkeypatch):
+    monkeypatch.setenv("B12X_DISK_BACKEND", "gds")
+    with pytest.raises(ValueError, match="GDS backend does not support a row cache"):
+        _cache(cache_rows=8, cache_tier="device")
