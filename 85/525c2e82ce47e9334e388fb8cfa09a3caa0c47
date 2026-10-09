@@ -1,0 +1,20 @@
+flashinfer/experimental/b12x/sequence/_shared/disk_table.py
+  h_15da545fc8cfbe 133,136-152,167-169,189-194,196-211,215-218,238,244-255,270-272,283-345,376-377,409-410,480-516,518-566,571-576,598,601,607,612-625
+flashinfer/experimental/b12x/sequence/_shared/row_cache.py
+  h_15da545fc8cfbe 1-154
+flashinfer/experimental/b12x/sequence/ple_embedding/_disk.py
+  h_15da545fc8cfbe 16-21,24-31,54-56
+tests/experimental/b12x/sequence/test_disk_row_cache.py
+  h_15da545fc8cfbe 291-380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "85525c2e82ce47e9334e388fb8cfa09a3caa0c47",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
