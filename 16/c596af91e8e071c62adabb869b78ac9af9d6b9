@@ -1,0 +1,14 @@
+flashinfer/experimental/b12x/sequence/_shared/formal/DESIGN.md
+  h_15da545fc8cfbe 11-14,108-154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "16c596af91e8e071c62adabb869b78ac9af9d6b9",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
