@@ -1,0 +1,20 @@
+flashinfer/experimental/b12x/sequence/_shared/formal/DESIGN.md
+  h_15da545fc8cfbe 1-127
+flashinfer/experimental/b12x/sequence/_shared/formal/broken-use-after-free.itf.json
+  h_15da545fc8cfbe 1
+flashinfer/experimental/b12x/sequence/_shared/formal/results.md
+  h_15da545fc8cfbe 1-99
+flashinfer/experimental/b12x/sequence/_shared/formal/slotpool.qnt
+  h_15da545fc8cfbe 1-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8656be3d4d800112340e14204deeea0114c7e4f5",
+  "prompts": {},
+  "humans": {
+    "h_15da545fc8cfbe": {
+      "author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
