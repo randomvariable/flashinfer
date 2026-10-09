@@ -8,8 +8,10 @@ proven (see `results.md`).
 
 ## 1. Problem
 
-A PLE (n-gram embedding) table is 20,000,000 rows × (80 B NVFP4 weight + 10 B
-group-16 scale) = 26.8 GiB, far too large for VRAM. `DiskRowCache` reads the
+A PLE (n-gram embedding) table is **320,001,536 rows × (80 B packed-NVFP4 weight +
+10 B E4M3 group-64 scale) = 26.9 GiB**, in 128 shard files of 2,500,012 rows each
+(`split_ngram_parts: 128`; measured from the CSF QAD checkpoint headers), far too
+large for VRAM. `DiskRowCache` reads the
 rows a step needs over io_uring (O_DIRECT, fixed buffers/files, 4 KiB block
 coalescing) into a batch-sized mapped-host staging buffer; a Triton decode
 kernel then gathers rows from it. Every step re-reads its rows — the cache
@@ -103,25 +105,50 @@ reading decode's CUDA event retires. That guard is what the proof pins.
 3. `test_disk_row_cache.py` byte-identity suite green on GB10 across both tiers
    and both sources (already green: 25 passed).
 
-## 6. Performance verdict and the go/no-go gate
+## 6. Performance verdict (measured, 2026-10-09)
 
-**GB10: dead.** A 100k-row host-tier SIEVE cache produced no throughput change
-at any concurrency (lil-bench c=1,4,8,16, 3 interleaved rounds): hit-rate
-*decays* to ~0.42 at c=16 (16 concurrent sequences blow up the per-step working
-set), and the io_uring reads are fully hidden behind compute. c=1 decode A/B was
-noise (t=−1.07); GSM8K was consistently −0.78 tok/s — that penalty is the Python
-plan in prefill chunks, not a missed disk win. So the Python cache already
-cannot win on GB10, and zero-copy (which only removes the plan + copy overhead
-of the same cache) can at best claw the −0.78 back to ~0, never positive.
+Method: cloned the live production pod spec on server21 (native SM120, RTX PRO
+6000 96 GiB, full stack: LMCache recurrent connector, 1 MiB context,
+`--gpu-memory-utilization 0.985`, MTP k=3) via the llm-d ArgoCD app scale-down;
+arms = same image + env, differing only in overlay files and `B12X_ROW_CACHE_*` /
+`ple_table_memory`. Metrics from `llm-inference-bench` (pinned v0.7.5) inside the
+modelserver container: sustained c=1 decode (45 s) and GSM8K 64-item profile
+(64×256 tokens).
 
-**SM120/WSL2: untested, and the only place the feature could pay.** The
-end-user's original symptom (RTX PRO 6000 under WSL2) had a 4.5 ms/step host
-gap and disk PLE reads a suspected contributor. The pinned-memory fix
-(`VLLM_WSL2_ENABLE_PIN_MEMORY=1`, +21 % c=1) already collapsed the *host-sync*
-part of that gap, which argues the disk specifically was not the bottleneck —
-but that is not conclusive for SM120. **Gate:** before building the C/zero-copy
-path, run the disk-off vs cache-on vs `ple_table_memory=ram` A/B on server21
-(native SM120; requires scaling down the production `rtx6000-qwen38-flash-next`
-via ArgoCD first). If `ram` ≫ `disk` and cache-on closes most of that gap, the
-disk is exposed and the C path is worth building; if not, ship the cache as
-formally-proven-but-off-by-default and do not build C.
+| arm | decode tok/s | gsm8k tok/s | cache hit rate |
+|---|---|---|---|
+| disk, no cache (4 boots) | 147.6 ± 2.7 | 193.6 ± 3.1 | — |
+| disk + host-tier pool 100k (3) | 153.2 ± 5.4 | 200.1 ± 1.9 | 0.44–0.46 |
+| disk + host-tier pool 5M (1) | 142.6 | 200.5 | 0.45 (resident 317k) |
+| disk + device-tier pool 100k (2) | 146.5 ± 4.2 | 192.6 ± 2.5 | ~0.46 |
+| `ple_table_memory=ram` (1) | **168.8 (+14.4 %)** | **224.5 (+16.0 %)** | — |
+
+Paired host−none deltas: gsm8k +7.8 / +7.1 / +8.9 (mean **+7.9 ± 1.0, t=14.3,
+3/3 positive**, ≈ +4 %); decode +10.3 / +6.6 / +1.4 (all positive, high variance
+in 45 s windows). Acceptance length 3.02–3.13 across all arms: a throughput
+effect, not a numerics effect.
+
+Findings:
+
+1. **The disk read IS exposed on SM120 — ~14 %.** The ram ceiling proves it.
+2. **The row cache recovers only ~25 % of that exposure, and pool size is not
+   the lever:** hit rate saturates at ~0.45 whether the pool holds 100k or 5M
+   rows (the whole re-usable working set is ~317k rows; 100k rows = 8.6 MiB
+   already captures it). The remaining misses are rows read once per session —
+   no eviction policy recovers them.
+3. **Zero-copy/C-plan is therefore REJECTED on evidence.** The unclaimed ~10 %
+   sits on the MISS path (8.3 ms per 1024-row io_uring wave, measured), which
+   still touches NVMe no matter who owns the bookkeeping; the C plan addresses
+   ~20 µs/step of Python and one host memcpy — the wrong 10 %. The device tier
+   additionally pays GPU `index_select`/`index_copy` work per step that zeroes
+   its own miss savings at 64-row waves (measured wash).
+4. **Ship:** the Python host-tier cache as-is, opt-in, default off, pool 100k
+   rows (8.6 MiB) — a stable +4 % on prefill-heavy profiles at ~zero cost and
+   zero VRAM. **For users wanting the full disk win on SM120-class boxes, the
+   answer is `ple_table_memory=ram`** (+14 %, 26.9 GiB host RAM — affordable
+   everywhere this model runs, which already spends 24–32 GiB on lmcache L1),
+   not new kernel code. WSL2 will differ (virtio-blk raises miss cost further;
+   ram/cache matter more there).
+
+Not measured: WSL2 SM120 (end-user board); single boots for 5m/ram arms
+(ceiling direction is unambiguous, magnitude ±3 %).
