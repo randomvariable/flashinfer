@@ -25,6 +25,12 @@ if TYPE_CHECKING:
 # stop its daemon thread. Distinct by identity from any id list a job may hold.
 _PREFETCH_SENTINEL = object()
 
+# Row-cache replacement policies, and the value of ``B12X_ROW_CACHE_POLICY``
+# accepted at construction. ``s3fifo`` selects the S3-FIFO sibling of
+# ``SieveIndex``; both own the same slot pool and the same plan/reserve
+# contract, so nothing below the index is policy-aware.
+_ROW_CACHE_POLICIES = ("sieve", "s3fifo")
+
 
 def _check_cuda(error: cudart.cudaError_t, operation: str) -> None:
     from cuda.bindings import runtime as cudart
@@ -144,17 +150,18 @@ class DiskRowCache:
 
     Rows come from checkpoint shards via io_uring/GDS, or from ``host_rows``:
     CPU tensors holding this shard's rows ``[shard_start, shard_end)`` in id
-    order. An optional SIEVE row cache (``cache_rows`` > 0) keeps recently
-    read rows so repeated n-grams skip the source:
+    order. An optional row cache (``cache_rows`` > 0, policy ``sieve`` or
+    ``s3fifo``) keeps recently read rows so repeated n-grams skip the source:
 
     * ``cache_tier="host"`` keeps them in host memory and stages through the
       mapped-host buffer. On unified-memory parts (GB10) this is the only copy.
     * ``cache_tier="device"`` keeps them in device memory, stages into a device
       buffer, and transfers only misses (discrete GPUs).
 
-    ``cache_rows``/``cache_tier`` default to ``B12X_ROW_CACHE_ROWS`` (0, off)
-    and ``B12X_ROW_CACHE_TIER`` (``auto``: host on integrated GPUs, device
-    otherwise). The GDS backend stages on the device itself and is not cached.
+    ``cache_rows``/``cache_tier``/``policy`` default to
+    ``B12X_ROW_CACHE_ROWS`` (0, off), ``B12X_ROW_CACHE_TIER`` (``auto``: host on
+    integrated GPUs, device otherwise) and ``B12X_ROW_CACHE_POLICY``
+    (``sieve``). The GDS backend stages on the device itself and is not cached.
 
     ``prefetch(ids)`` warms the cache ahead of the read path from a background
     worker, driven by ``B12X_PLE_PREFETCH`` (off by default). Reserved rows sit
@@ -180,6 +187,7 @@ class DiskRowCache:
         queue_depth: int = 64,
         cache_rows: int | None = None,
         cache_tier: str | None = None,
+        policy: str | None = None,
         host_rows: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> None:
         from b12x.loader._native import load
@@ -219,10 +227,23 @@ class DiskRowCache:
             cache_tier = "host" if integrated else "device"
         if cache_tier not in ("host", "device"):
             raise ValueError("cache_tier must be host, device or auto")
+        if cache_rows:
+            if policy is None:
+                policy = os.environ.get("B12X_ROW_CACHE_POLICY", "sieve")
+            # Operators set this from a shell or a manifest, so surrounding space
+            # and case are not an error. An unknown name is, and it is rejected
+            # here rather than silently falling back to the default policy.
+            policy = policy.strip().lower()
+            if policy not in _ROW_CACHE_POLICIES:
+                raise ValueError(
+                    "B12X_ROW_CACHE_POLICY must be one of "
+                    + ", ".join(_ROW_CACHE_POLICIES)
+                )
         if cache_rows and self._backend == "gds":
             raise ValueError("the GDS backend does not support a row cache")
         self.cache_rows = cache_rows
         self.cache_tier = cache_tier if cache_rows else None
+        self.row_cache_policy = policy if cache_rows else None
         self._gds = None
         self._native = None
         self._reader = None
@@ -323,7 +344,7 @@ class DiskRowCache:
         return weight.numpy(), (scale.numpy() if self.scale_row_bytes else None)
 
     def _init_row_cache(self) -> None:
-        from .row_cache import SieveIndex
+        from .row_cache import S3FifoIndex, SieveIndex
 
         rows = self.cache_rows
         widths = [self.weight_row_bytes] + (
@@ -333,7 +354,8 @@ class DiskRowCache:
         # initialize_model time), so every CPU allocation here names the device
         # explicitly; a bare torch.empty(pin_memory=True) would build a meta
         # tensor and fail "Only dense CPU tensors can be pinned".
-        self._index = SieveIndex(rows)
+        index_cls = S3FifoIndex if self.row_cache_policy == "s3fifo" else SieveIndex
+        self._index = index_cls(rows)
         # Miss rows land here first; the CPU reads them back, so they are plain
         # pinned memory rather than write-combined.
         self._miss_ids = torch.empty(
@@ -829,6 +851,7 @@ class DiskRowCache:
                 lookups = self._index.hits + self._index.misses
                 result.update(
                     row_cache_tier=self.cache_tier,
+                    row_cache_policy=self.row_cache_policy,
                     row_cache_rows=self.cache_rows,
                     row_cache_resident=len(self._index),
                     row_cache_bytes=pool_bytes,
