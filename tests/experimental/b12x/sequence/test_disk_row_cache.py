@@ -367,9 +367,15 @@ def _byte_identity_round_trip(tmp_path, monkeypatch, policy, tier, capacity, sou
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("tier", ["host", "device"])
-@pytest.mark.parametrize("capacity", [1, 5, 64, 400])
-@pytest.mark.parametrize("source", ["disk", "host"])
+@pytest.mark.parametrize(
+    ("tier", "capacity", "source"),
+    [
+        (t, c, s)
+        for t in ("host", "device")
+        for c in (1, 5, 64, 400)
+        for s in ("disk", "host")
+    ],
+)
 def test_sieve_cached_rows_match_uncached_bytes(
     tmp_path, monkeypatch, tier, capacity, source
 ):
@@ -378,10 +384,16 @@ def test_sieve_cached_rows_match_uncached_bytes(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("policy", ["sieve", "s3fifo"])
-@pytest.mark.parametrize("tier", ["host", "device"])
-@pytest.mark.parametrize("capacity", [1, 5, 64, 400])
-@pytest.mark.parametrize("source", ["disk", "host"])
+@pytest.mark.parametrize(
+    ("policy", "tier", "capacity", "source"),
+    [
+        (p, t, c, s)
+        for p in ("sieve", "s3fifo")
+        for t in ("host", "device")
+        for c in (1, 5, 64, 400)
+        for s in ("disk", "host")
+    ],
+)
 def test_s3fifo_cached_rows_match_uncached_bytes(
     tmp_path, monkeypatch, policy, tier, capacity, source
 ):
@@ -392,6 +404,26 @@ def test_s3fifo_cached_rows_match_uncached_bytes(
     bytes and that a victim never clobbers a row the same batch reads.
     """
     _byte_identity_round_trip(tmp_path, monkeypatch, policy, tier, capacity, source)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    ("tier", "capacity", "source"),
+    [
+        (t, c, s)
+        for t in ("host", "device")
+        # W-TinyLFU budgets are 1% window + SLRU segments; below 100 rows every
+        # segment truncates to zero and the cache admits nothing (matching the
+        # C reference), so this arm starts where the policy can hold rows.
+        for c in (128, 400)
+        for s in ("disk", "host")
+    ],
+)
+def test_wtinylfu_cached_rows_match_uncached_bytes(
+    tmp_path, monkeypatch, tier, capacity, source
+):
+    """W-TinyLFU is a drop-in sibling too: same fixture, same bytes."""
+    _byte_identity_round_trip(tmp_path, monkeypatch, "wtinylfu", tier, capacity, source)
 
 
 def test_sieve_keeps_visited_rows_over_newer_one_hit_rows():
@@ -409,52 +441,99 @@ def test_sieve_keeps_visited_rows_over_newer_one_hit_rows():
 
 
 def test_s3fifo_small_queue_promotes_hits_and_ghosts_re_admit():
-    """Hand-checked S3-FIFO sequence over a 10-row cache (S 1, M 9, G 1)."""
+    """Hand-checked libCacheSim sequence over a 10-row cache (S 1, M 9, G 9).
+
+    Mirrors S3FIFO.c exactly: pre-first-eviction, a full S admits newcomers to
+    M (``has_evicted`` fast path); promotion needs ``move-to-main-threshold=2``
+    and keeps the counter; one-hit S rows demote to ghosts; a miss on a ghost
+    is admitted straight into M; the M clock spends one credit per chance.
+    """
     from b12x.sequence._shared.row_cache import S3FifoIndex
 
     index = S3FifoIndex(10)
-    assert index._small_cap == 1 and index._main_cap == 9 and index._ghost_cap == 1
+    assert index._small_cap == 1 and index._main_cap == 9 and index._ghost_cap == 9
 
-    # Every new row joins S. Each is read once before the next insert recycles
-    # it, so it is promoted into M with a reset counter instead of dropped: S
-    # holds only the row that has not been recycled yet.
-    for key in range(1, 10):
-        index.insert(key)
-        index.get(key)
-    assert [index._key[slot] for slot in index._small] == [9]
-    assert [index._key[slot] for slot in index._main] == [1, 2, 3, 4, 5, 6, 7, 8]
-    assert index._freq[index._slot[9]] == 1
-    assert all(index._freq[index._slot[key]] == 0 for key in range(1, 9))
-    assert not index._ghost
-
-    # A row re-read while in M refills its counter, and the next S row promotes
-    # beside it rather than displacing anything: the pool still had a slot.
+    # Fill: 1 earns one hit in S; the has_evicted fast path then sends every
+    # newcomer to M, so S keeps exactly the row that has not been recycled.
+    index.insert(1)
     index.get(1)
-    index.insert(20)
-    assert [index._key[slot] for slot in index._main] == list(range(1, 10))
-    assert [index._key[slot] for slot in index._small] == [20]
-    assert index._freq[index._slot[1]] == 1
+    index.insert(2)
+    index.get(2)
+    for key in range(3, 11):
+        index.insert(key)
+    assert [index._key[slot] for slot in index._small] == [1]
+    assert [index._key[slot] for slot in index._main] == list(range(2, 11))
+    assert not index._ghost and not index._has_evicted
+
+    # First eviction: S's front had a single hit -- below threshold -- so it
+    # demotes to a ghost and the newcomer takes S.
+    index.insert(11)
+    assert index._has_evicted
+    assert [index._key[slot] for slot in index._small] == [11]
+    assert list(index._ghost) == [1]
+
+    # A zero-credit S row demotes too, and its ghost entry queues behind 1's.
+    index.insert(12)
+    assert [index._key[slot] for slot in index._small] == [12]
+    assert list(index._ghost) == [1, 11]
+
+    # Re-inserting a ghost skips S entirely and joins M's tail: the pending
+    # insert is counted into M's overfill test (C parent loop), so M -- not S
+    # -- pays: the clock spends 2's earned credit on one chance and evicts 3
+    # (no credit). 12, S's front, stays.
+    index.insert(1)
+    assert [index._key[slot] for slot in index._small] == [12]
+    assert [index._key[slot] for slot in index._main] == [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        2,
+        1,
+    ]
+    assert index._freq[index._slot[2]] == 0
+    assert 3 not in index and 1 not in index._ghost
     assert len(index) == 10
 
-    # 20 is never read, so recycling it from S demotes it to a ghost: the key
-    # stays, the payload slot goes.
-    index.insert(21)
-    assert 20 not in index
-    assert list(index._ghost) == [20]
-    assert [index._key[slot] for slot in index._small] == [21]
+    # Threshold promotion keeps the counter: on a fresh cache, 1 read twice
+    # earns a stay in M -- at full strength -- where the zero-credit front of
+    # M is the row that pays for the next admission.
+    index = S3FifoIndex(10)
+    index.insert(1)
+    index.get(1)
+    index.get(1)
+    index.insert(2)
+    index.get(2)
+    for key in range(3, 11):
+        index.insert(key)
+    index.insert(11)
+    assert index._freq[index._slot[1]] == 2
+    assert [index._key[slot] for slot in index._main] == [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        1,
+        2,
+    ]
+    assert [index._key[slot] for slot in index._small] == [11]
 
-    # A miss on a ghost is admitted straight into M, skipping S entirely.
-    # Making room pops M's front: 1 still holds the credit its re-read earned,
-    # so it is reinserted at the tail and 2 -- out of credit -- is the row that
-    # leaves. A plain FIFO would have evicted 1 and kept 2.
-    index.insert(20)
-    assert index._slot[20] not in index._small
-    assert index._queue[index._slot[20]] == S3FifoIndex._MAIN
-    assert 20 not in index._ghost
-    assert [index._key[slot] for slot in index._main] == [3, 4, 5, 6, 7, 8, 9, 1, 20]
-    assert index._freq[index._slot[1]] == 0
-    assert 1 in index and 2 not in index
-    assert len(index) == 10
+    # A reserved prefetch row is invisible until confirm. The reservation is
+    # the miss that pays for the slot: with S's only row (11, no credit) still
+    # queued, the eviction demotes it to a ghost, and 77 -- no ghost -- takes
+    # S, exactly where the C's plain-path insert would land it.
+    slot = index.reserve(77)
+    assert index.get(77) is None and 77 not in index
+    assert index.confirm(slot) == slot
+    assert index._queue[slot] == S3FifoIndex._SMALL
+    assert [index._key[s] for s in index._small] == [77]
+    assert 11 in index._ghost and index.is_ready(77)
 
 
 def test_s3fifo_churn_keeps_every_slot_owned_by_one_row():

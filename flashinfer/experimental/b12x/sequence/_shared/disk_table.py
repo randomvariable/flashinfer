@@ -26,10 +26,11 @@ if TYPE_CHECKING:
 _PREFETCH_SENTINEL = object()
 
 # Row-cache replacement policies, and the value of ``B12X_ROW_CACHE_POLICY``
-# accepted at construction. ``s3fifo`` selects the S3-FIFO sibling of
-# ``SieveIndex``; both own the same slot pool and the same plan/reserve
-# contract, so nothing below the index is policy-aware.
-_ROW_CACHE_POLICIES = ("sieve", "s3fifo")
+# accepted at construction. ``s3fifo`` selects the S3-FIFO sibling and
+# ``wtinylfu`` the W-TinyLFU sibling of ``SieveIndex``; all own the same slot
+# pool and the same plan/reserve contract, so nothing below the index is
+# policy-aware.
+_ROW_CACHE_POLICIES = ("sieve", "s3fifo", "wtinylfu")
 
 # Suffixes accepted by ``B12X_ROW_CACHE_BYTES``, as multipliers of the decimal
 # amount. A bare number is plain bytes.
@@ -212,9 +213,10 @@ class DiskRowCache:
       discrete), ``host`` or ``device``. On a discrete GPU the ``auto`` default
       selects ``device``, which measured *slower* than no cache at c=1; the
       SM120 result supports explicit ``host`` there.
-    * ``B12X_ROW_CACHE_POLICY`` — ``sieve`` (default) or ``s3fifo``; S3-FIFO
-      leads at 100k rows on the production row-id trace (libCacheSim replay,
-      see ``formal/DESIGN.md``).
+    * ``B12X_ROW_CACHE_POLICY`` — ``sieve`` (default), ``s3fifo`` or
+      ``wtinylfu``; S3-FIFO leads at 100k rows on the production row-id trace
+      (libCacheSim replay, see ``formal/DESIGN.md``), and W-TinyLFU is the
+      cachesim-WTinyLFU-parity sibling.
     * ``B12X_PLE_PREFETCH`` — nonzero turns the ``prefetch`` worker on. Under
       vLLM the runner hook is gated separately by ``VLLM_PLE_PREFETCH``; both
       must be set.
@@ -417,7 +419,7 @@ class DiskRowCache:
         return weight.numpy(), (scale.numpy() if self.scale_row_bytes else None)
 
     def _init_row_cache(self) -> None:
-        from .row_cache import S3FifoIndex, SieveIndex
+        from .row_cache import S3FifoIndex, SieveIndex, WTinyLfuIndex
 
         rows = self.cache_rows
         widths = [self.weight_row_bytes] + (
@@ -427,7 +429,10 @@ class DiskRowCache:
         # initialize_model time), so every CPU allocation here names the device
         # explicitly; a bare torch.empty(pin_memory=True) would build a meta
         # tensor and fail "Only dense CPU tensors can be pinned".
-        index_cls = S3FifoIndex if self.row_cache_policy == "s3fifo" else SieveIndex
+        index_cls = {
+            "s3fifo": S3FifoIndex,
+            "wtinylfu": WTinyLfuIndex,
+        }.get(self.row_cache_policy, SieveIndex)
         self._index = index_cls(rows)
         # Miss rows land here first; the CPU reads them back, so they are plain
         # pinned memory rather than write-combined.

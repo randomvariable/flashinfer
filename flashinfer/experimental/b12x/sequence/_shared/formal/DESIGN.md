@@ -4,7 +4,9 @@ Design + formal-model artifact for `DiskRowCache` (`../disk_table.py`) and
 `SieveIndex` (`../row_cache.py`). Status: **implemented in Python (opt-in, off by
 default); the C/zero-copy reclamation path is NOT built and is gated on the
 SM120 measurement described in §6.** The correctness of its central invariant is
-proven (see `results.md`).
+proven (see `results.md`). The full policy set (SIEVE / S3-FIFO / W-TinyLFU),
+their libCacheSim reference-parity gates, and the measured comparison at the
+operating capacity are in [`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md).
 
 ## 1. Problem
 
@@ -195,8 +197,11 @@ Revisions and additions to the §6 verdict:
    arm order.
 
 Not measured here: the `s3fifo` policy and the in-b12x `B12X_PLE_PREFETCH`
-worker path (both postdate the tree under test) — re-run the sweep matrix on
-the branch head before quoting policy or worker numbers.
+worker path end-to-end (both postdate the tree under test). Offline replay of
+all three policies on the production traces is now measured and gate-verified
+against libCacheSim in [`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md);
+re-run this sweep matrix on the branch head before quoting end-to-end policy
+or worker numbers.
 
 Not measured: WSL2 SM120 (end-user board); single boots for 5m/ram arms
 (ceiling direction is unambiguous, magnitude ±3 %).
