@@ -70,9 +70,10 @@ batch=1, the c=1 decode shape):
 
 1. **Reference parity of the classes** (below): each index vs `cachesim`
    running the same trace/capacity, at caps 1k..1M. Harnesses:
-   `probe/s3fifo_parity.py`, `probe/wtinylfu_parity.py`, `probe/policy_matrix.py`
-   (workstation `~/.cache/vllm-multiarch-oci/probe/`, results
-   `probe/policy_matrix.csv`, `probe/wtinylfu_gate_results.csv`). W-TinyLFU is
+   `probe/s3fifo_parity.py`, `probe/wtinylfu_parity.py`,
+   `probe/policy_matrix.py` (workstation `~/.cache/vllm-multiarch-oci/probe/`;
+   results `probe/policy_matrix_v2.csv` — the v1 CSV predates the strtol
+   parser fix — and `probe/wtinylfu_gate_results.csv`). W-TinyLFU is
    additionally matched **request-by-request** against a C driver linked
    against `liblibCacheSim.a` (`probe/xxhcheck/trace_dump.c`), so its true
    delta is 0, not merely within print rounding.
