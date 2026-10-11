@@ -138,12 +138,21 @@ Findings:
    rows (the whole re-usable working set is ~317k rows; 100k rows = 8.6 MiB
    already captures it). The remaining misses are rows read once per session —
    no eviction policy recovers them.
-3. **Zero-copy/C-plan is therefore REJECTED on evidence.** The unclaimed ~10 %
-   sits on the MISS path (8.3 ms per 1024-row io_uring wave, measured), which
-   still touches NVMe no matter who owns the bookkeeping; the C plan addresses
-   ~20 µs/step of Python and one host memcpy — the wrong 10 %. The device tier
-   additionally pays GPU `index_select`/`index_copy` work per step that zeroes
-   its own miss savings at 64-row waves (measured wash).
+3. **Zero-copy/C-plan is REJECTED on evidence, scoped to what was measured:
+   discrete-GPU decode waves on server21.** There, the unclaimed ~10 % sits on
+   the MISS path (8.3 ms per 1024-row io_uring wave, measured), which still
+   touches NVMe no matter who owns the bookkeeping; the C plan addresses
+   ~20 µs/step of Python and one host memcpy — the wrong 10 %. Two regimes are
+   **unmeasured** and keep the gate open: (a) prefill chunks (n = tokens x
+   head_count, up to 96 304) cost ~17 ms/step of Python at the x86 constant --
+   7500x the PCIe-Gen5 bounce (128 us theoretical) -- so if any of it is
+   exposed rather than overlapped with GPU compute, the C plan targets the
+   right term; (b) GB10's ARM cores have never been profiled for `_read_cached`
+   -- the 181 ns/id constant is x86-measured, plausibly 1.5-2.5x worse there,
+   while the bounce term is ~0 on a unified board. Both numbers must be taken
+   before quoting a cross-board C verdict. The device tier additionally pays
+   GPU `index_select`/`index_copy` work per step that zeroes its own miss
+   savings at 64-row waves (measured wash).
 4. **Ship:** the Python host-tier cache as-is, opt-in, default off — enable
    with `B12X_ROW_CACHE_BYTES=8.6MiB` (== `B12X_ROW_CACHE_ROWS=100000` at the
    PLE geometry's 90 B/row; the byte knob rounds down to whole rows) and
