@@ -3,9 +3,9 @@
 Design + formal-model artifact for `DiskRowCache` (`../disk_table.py`) and
 the row-cache index (`../row_cache.py` → the C extension
 `b12x/loader/_row_cache.c`). Status: **implemented in C (host tier), single
-S3-FIFO implementation; end-to-end sweep-validated (§9: +4.4 % decode, +7.6 %
-at c>=8, +5.8 gsm8k at 100k rows); off by default, and the 1 GiB default is
-disfavored by §9**; the SIEVE and W-TinyLFU
+S3-FIFO implementation; end-to-end sweep-validated at 100k rows (§9: +4.4 %
+decode, +7.6 % at c>=8, +5.8 gsm8k); off by default; the 1 GiB default has no
+end-to-end measurement yet (§9 retraction)**; the SIEVE and W-TinyLFU
 Python indices and the policy knob were removed as experiments — the
 measured comparison that justifies it is the decision record
 [`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md), and the Python S3-FIFO
@@ -314,47 +314,33 @@ on the 600 W part, do not build the C port; on Vera-class hardware the per-id
 host constant, not the GPU, sets whether prefill is host-bound, and that
 number must be measured on the actual host before the gate can flip.
 
-## 9. C-path concurrency sweep: c100k wins, the 1 GiB default does not (server21, 2026-10-11)
+## 9. C-path concurrency sweep at 100k rows (server21, 2026-10-11)
 
 The §7 protocol applied to the shipped C implementation (whole PR tree
-bind-mounted over the image's `b12x`, `B12X_ROW_CACHE_POLICY`/tier removed,
-C extension JIT-built inside the container): cloned production spec, GPU
-frozen off serving, full lil-bench sweep `--concurrency 1,2,4,8,16` x
-`--contexts 0,16k,64k,128k`, 45 s/cell, **2 rounds reversed arm order**
-(round 1 `none,c,c100k`; round 2 `c100k,c,none`), pooled per cell, GSM8K
-c=1 profile per arm. Harness `~/ab/run_c_sweep.sh`, logs
-`~/ab/c_sweep_r{1,2}.log` on server21.
+bind-mounted over the image's `b12x`, C extension JIT-built inside the
+container): cloned production spec, GPU frozen off serving, full lil-bench
+sweep `--concurrency 1,2,4,8,16` x `--contexts 0,16k,64k,128k`, 45 s/cell,
+**2 rounds reversed arm order**, pooled per cell, GSM8K c=1 profile per arm.
+Harness `~/ab/run_c_sweep.sh`, logs `~/ab/c_sweep_r{1,2}.log` on server21.
 
-| arm | decode pooled Δ vs none | c≥8 | gsm8k tok/s (pooled) | acceptance |
-|---|---|---|---|---|
-| none (disk, no cache) | baseline | baseline | 204.0 | 2.98/3.10 |
-| **c, 100k rows** | **+4.35 %** | **+7.61 %** | **209.8** | 3.01 |
-| c, 1 GiB default | −0.49 % | ≈ −1 % | 202.6 | 3.04-3.07 |
+| arm | decode pooled Δ vs none | c≥8 | gsm8k tok/s (pooled) |
+|---|---|---|---|
+| none (disk, no cache) | baseline | baseline | 204.0 |
+| **C, 100k rows** | **+4.35 %** (t = +4.6) | **+7.61 %** | **209.8** |
 
-Readings:
+The C port at 100k rows beats the Python host tier's +3.4-3.6 % (§7).
+Round-to-round spread is 3.1 % mean-abs per cell, and the c=1 delta (pooled
++0.1 %) sits inside it: the gain is in the high-concurrency regime, where the
+miss wave and pool copies compete with the step thread.
 
-1. **The C port lands the throughput the Python host tier promised and then
-   some**: +4.35 % pooled (+7.6 % at c>=8) and +5.8 gsm8k tok/s at 100k
-   rows, vs the Python arms' +3.4-3.6 % (§7). Round-to-round spread 3.1 %
-   mean-abs per cell keeps the c=1 delta (pooled +0.1 %) within noise, so
-   the gain is genuinely the high-concurrency regime where the io_uring miss
-   wave and pool copies crowd the step thread.
-2. **The 1 GiB default (11.9 M rows) is a regression: −0.5 % vs no cache,
-   −4.6 % vs 100k.** §6/§7's "size is not the lever" held only inside the
-   100k-317k band; beyond the ~317k-row working set the pool goes
-   pathologically wrong — every ghost admission targets an empty M (no clock
-   pressure), and S's one-hit filter now shelters long-dead rows against a
-   queue that never recycles (the S=10 % / 1.19 M-row regime has no eviction
-   signal at all at this trace's reuse depth). Direction was consistent
-   across both rounds; magnitude sits near the noise floor, but the *sign*
-   (1 GiB < 100k) is the decision-relevant half and reproduces.
-3. **Decision owed (user's call, recorded here)**: the sweep supports an
-   explicit ~100k-row / 8.6 MiB class as the recommended size on SM120. If a
-   default is wanted, a measured candidate is the 317k-row working-set size
-   (~28 MiB) — where all policies converged in §4 — not 1 GiB; both should
-   go through this same two-round sweep before shipping as a default.
-4. Arm `c` here means the C index at the given size (policy is fixed); the
-   `c` column of round 1 vs 2 (152.5/161.1 at 0@1) shows boot-order noise of
-   the same size as the 1 GiB penalty, which is why the *relative* c-vs-c100k
-   comparison (−4.55 %, same-round pairs) carries the verdict, not the
-   absolute 1 GiB number.
+**Retracted: the 1 GiB arm.** The harness ran a third arm intended to test
+the 1 GiB default by setting no row-cache variable. The resolver enables the
+cache only when `B12X_ROW_CACHE_BYTES`, `_ROWS` or `_TIER` is set, so that arm
+ran with the cache **off**. Its result (−0.49 % vs none, t = −0.9) is a
+second no-cache measurement, not a 1 GiB measurement. An earlier revision of
+this section reported it as a 1 GiB regression and explained it with an S3-FIFO
+queue-collapse mechanism; both claims were wrong. A CPU replay of the C index
+shows the 1 GiB pool is cheaper per lookup than 100k (19.6 vs 39.3 ns/id at
+1024-id batches) and hits more often. The 1 GiB default has no end-to-end
+measurement yet. The harness now asserts the cache is enabled before
+benchmarking an arm.
