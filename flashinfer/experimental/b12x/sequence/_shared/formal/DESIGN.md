@@ -2,8 +2,10 @@
 
 Design + formal-model artifact for `DiskRowCache` (`../disk_table.py`) and
 `SieveIndex` (`../row_cache.py`). Status: **implemented in Python (opt-in, off by
-default); the C/zero-copy reclamation path is NOT built and is gated on the
-SM120 measurement described in §6.** The correctness of its central invariant is
+default); the C/zero-copy reclamation path is NOT built. Its gate is
+§6/§8: the prefill exposure measurement landed (§8 — host work overlapped,
+no win today), the GB10 ARM Python constant is open. The correctness of its
+central invariant is
 proven (see `results.md`). The full policy set (SIEVE / S3-FIFO / W-TinyLFU),
 their libCacheSim reference-parity gates, and the measured comparison at the
 operating capacity are in [`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md).
@@ -142,12 +144,13 @@ Findings:
    discrete-GPU decode waves on server21.** There, the unclaimed ~10 % sits on
    the MISS path (8.3 ms per 1024-row io_uring wave, measured), which still
    touches NVMe no matter who owns the bookkeeping; the C plan addresses
-   ~20 µs/step of Python and one host memcpy — the wrong 10 %. Two regimes are
-   **unmeasured** and keep the gate open: (a) prefill chunks (n = tokens x
-   head_count, up to 96 304) cost ~17 ms/step of Python at the x86 constant --
-   7500x the PCIe-Gen5 bounce (128 us theoretical) -- so if any of it is
-   exposed rather than overlapped with GPU compute, the C plan targets the
-   right term; (b) GB10's ARM cores have never been profiled for `_read_cached`
+   ~20 µs/step of Python and one host memcpy — the wrong 10 %. Two regimes
+   were **unmeasured** at that date; (a) has since been measured (see §8):
+   prefill chunks (n = tokens x head_count, up to 96 304) cost ~32 ms/call of
+   Python on x86, but cold-prefill calibration shows the host work is
+   overlapped and only ~0.5-1 % exposed, so the C plan's CPU term is the
+   right one and the prize is the exposed fraction, not the 17 ms estimate;
+   (b) GB10's ARM cores have never been profiled for `_read_cached`
    -- the 181 ns/id constant is x86-measured, plausibly 1.5-2.5x worse there,
    while the bounce term is ~0 on a unified board. Both numbers must be taken
    before quoting a cross-board C verdict. The device tier additionally pays
@@ -214,3 +217,48 @@ or worker numbers.
 
 Not measured: WSL2 SM120 (end-user board); single boots for 5m/ram arms
 (ceiling direction is unambiguous, magnitude ±3 %).
+
+## 8. Prefill exposure calibration — the C-port gate measurement (server21, 2026-10-11)
+
+§6 finding 3 left open whether the ~17 ms/step Python of `DiskRowCache._read_cached`
+at prefill chunk size (n = tokens x head_count) is *exposed* or hidden under GPU
+compute. Measured with the calibration overlay (`~/ab/b12x/sequence/_shared/disk_table_cal.py`
+mounted over `disk_table.py`; `B12X_CAL_SLEEP_NS` injects a `time.sleep()` at the
+top of every cached read — CPU time on the host step thread inside the timed
+window; `B12X_CAL_TIMING=1` self-times the path): cloned production spec, GPU
+frozen off serving, `--prefill-only --prefill-contexts 131072` cold prompts x3
+passes, one arm per boot. Harness `~/ab/run_prefill.sh`, log `~/ab/prefill_r1.log`.
+
+| arm | prefill tok/s | Δ vs mean(cache..cal4) | injected CPU/call |
+|---|---|---|---|
+| nocache (disk, no pool) | 6536 | — | — |
+| cache host-tier 100k | 6603 (+1.0 % vs nocache) | +0.2…−0.6 % | 0 (measured path: 32.1 ms/call mean, n≈207, max 167 ms) |
+| cal0 / cal2 / cal4 | 6631 / 6578 / 6651 | ±0.5 % (noise band) | +0 / +2 / +4 ms |
+| cal8 | 6314 | **−4.6 %** | +8 ms |
+
+Readings:
+
+1. **Host work in the cached path is overlapped, not exposed, on discrete SM120
+   prefill.** Injections up to 4 ms/call move throughput inside the arm-to-arm
+   noise; the 8 ms/call injection — 20 % of the ~40.6 ms chunk cycle
+   (96 304 ids = 268 tokens at the measured 6.6k tok/s) — costs 4.6 %. If the
+   host were the critical path, 8 ms on a 32 ms base would be ~25 %.
+2. **Self-time, n=209 calls / 12.2 M ids: mean 32-33 ms, max 167 ms** (first
+   chunks populate the 100k pool; steady-state hits land near the 181 ns/id
+   constant from §1). The 17 ms §1 estimate scaled to the warm full 96 304-id
+   chunk; the pool-resident miss wave (~0.42 ms at 0.985 hit rate) rides the
+   io_uring thread, not the step thread.
+3. **C-port verdict, prefill regime: no measurable win today.** Removing the
+   Python entirely could return at most the exposed fraction, ~0.5-1 % and
+   inside noise. The gate stays open with an explicit *trigger* rather than
+   staying vaguely open: the host currently fits in ~79 % of the chunk cycle;
+   when GPU-side work (b12x MoE/dense targets, §census in the RCA gist) pushes
+   the cycle under ~32 ms, Python becomes the critical path and the port must
+   be revisited.
+4. **Caveats:** single arm boot per cal point (±0.5 % observed spread); hit
+   rate 0.985 reflects the repeated 131k prompt (pass 1 warms the pool), so
+   the miss-wave term is understated — but it is the Python term the C port
+   targets, and that term was measured across the full id stream; cold-cache
+   prefill is a separate regime and is NOT covered here (its disk time is
+   NVMe, already ruled non-bookkeeping in §6); GB10's ARM per-id Python
+   constant remains unmeasured — the §6(b) half of the gate.
