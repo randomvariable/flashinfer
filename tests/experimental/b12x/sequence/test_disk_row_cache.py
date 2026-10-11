@@ -314,12 +314,13 @@ def _expected(source, ids):
     return expected
 
 
-def _byte_identity_round_trip(tmp_path, monkeypatch, policy, tier, capacity, source):
-    """Serve one batch pattern through ``policy`` and check every staged byte.
+def _byte_identity_round_trip(tmp_path, monkeypatch, capacity, source):
+    """Serve one batch pattern through the C S3-FIFO host cache and check
+    every staged byte.
 
     Cached staging must equal the source for repeats, in-batch duplicates,
     invalid IDs, and capacities that evict rows the same batch still reads.
-    Both replacement policies run this identical fixture, so choosing a policy
+    The single shipped policy runs this identical fixture, so the cache
     cannot change what the read path returns.
     """
     monkeypatch.setenv("B12X_DISK_BACKEND", "io_uring")
@@ -327,9 +328,7 @@ def _byte_identity_round_trip(tmp_path, monkeypatch, policy, tier, capacity, sou
     host_rows = None
     if source == "host":
         host_rows = tuple(p[7:290].contiguous() for p in payloads)
-    cache = _cache(
-        cache_rows=capacity, cache_tier=tier, host_rows=host_rows, policy=policy
-    )
+    cache = _cache(cache_rows=capacity, cache_tier="host", host_rows=host_rows)
     try:
         if source == "disk":
             for scale, data in zip((False, True), payloads):
@@ -340,10 +339,7 @@ def _byte_identity_round_trip(tmp_path, monkeypatch, policy, tier, capacity, sou
                     )
                     cache.add_shard(shard, str(path), 0, scale=scale)
         cache.freeze()
-        assert cache.stats()["row_cache_policy"] == policy
-        assert (cache.weight.device.type == "cuda") and (
-            (cache.weight_host is None) == (tier == "device")
-        )
+        assert (cache.weight.device.type == "cuda") and cache.weight_host is not None
         generator = torch.Generator().manual_seed(capacity)
         hot = torch.tensor([7, 8, 150, 151, 289, 6, 290, 2**40])
         for count in [40, 40, 1, 0, 17, 40, 40]:
@@ -359,246 +355,68 @@ def _byte_identity_round_trip(tmp_path, monkeypatch, policy, tier, capacity, sou
                         actual[:count].cpu(), _expected(data, ids), rtol=0, atol=0
                     )
         stats = cache.stats()
-        assert stats["row_cache_tier"] == tier
+        assert stats["row_cache_tier"] == "host"
         assert 0 < stats["row_cache_resident"] <= capacity
         assert stats["row_cache_hits"] > 0
+        # The deferred-free contract: the pool is only ever read/written
+        # inside a transaction, whose _cache_done event fences the next one.
+        assert cache._cache_used and cache._transaction_thread is None
     finally:
         cache.close()
 
 
 @torch.inference_mode()
 @pytest.mark.parametrize(
-    ("tier", "capacity", "source"),
-    [
-        (t, c, s)
-        for t in ("host", "device")
-        for c in (1, 5, 64, 400)
-        for s in ("disk", "host")
-    ],
+    ("capacity", "source"),
+    [(c, s) for c in (1, 5, 64, 400) for s in ("disk", "host")],
 )
-def test_sieve_cached_rows_match_uncached_bytes(
-    tmp_path, monkeypatch, tier, capacity, source
-):
-    """The default policy is still SIEVE, byte for byte as before the choice."""
-    _byte_identity_round_trip(tmp_path, monkeypatch, "sieve", tier, capacity, source)
+def test_cached_rows_match_uncached_bytes(tmp_path, monkeypatch, capacity, source):
+    """The C S3-FIFO host cache stages the source's bytes exactly.
 
-
-@torch.inference_mode()
-@pytest.mark.parametrize(
-    ("policy", "tier", "capacity", "source"),
-    [
-        (p, t, c, s)
-        for p in ("sieve", "s3fifo")
-        for t in ("host", "device")
-        for c in (1, 5, 64, 400)
-        for s in ("disk", "host")
-    ],
-)
-def test_s3fifo_cached_rows_match_uncached_bytes(
-    tmp_path, monkeypatch, policy, tier, capacity, source
-):
-    """S3-FIFO is a drop-in sibling: same fixture, same bytes.
-
-    Eviction order differs, so which row is still resident when a batch reads
-    it differs; what must not change is that a resident row holds the source's
-    bytes and that a victim never clobbers a row the same batch reads.
+    Eviction order is the reference class's, verified per request in
+    ``test_row_cache_policies.py``; what this fixture pins is the byte
+    contract: a resident row holds the source's bytes and a victim never
+    clobbers a row the same batch reads.
     """
-    _byte_identity_round_trip(tmp_path, monkeypatch, policy, tier, capacity, source)
+    _byte_identity_round_trip(tmp_path, monkeypatch, capacity, source)
 
 
-@torch.inference_mode()
-@pytest.mark.parametrize(
-    ("tier", "capacity", "source"),
-    [
-        (t, c, s)
-        for t in ("host", "device")
-        # W-TinyLFU budgets are 1% window + SLRU segments; below 100 rows every
-        # segment truncates to zero and the cache admits nothing (matching the
-        # C reference), so this arm starts where the policy can hold rows.
-        for c in (128, 400)
-        for s in ("disk", "host")
-    ],
-)
-def test_wtinylfu_cached_rows_match_uncached_bytes(
-    tmp_path, monkeypatch, tier, capacity, source
-):
-    """W-TinyLFU is a drop-in sibling too: same fixture, same bytes."""
-    _byte_identity_round_trip(tmp_path, monkeypatch, "wtinylfu", tier, capacity, source)
+@pytest.mark.parametrize("tier", ["device", "auto"])
+def test_device_tier_selection_is_removed(monkeypatch, tier):
+    """Asking for the deleted device tier raises and names the knob.
 
-
-def test_sieve_keeps_visited_rows_over_newer_one_hit_rows():
-    from b12x.sequence._shared.row_cache import SieveIndex
-
-    index = SieveIndex(3)
-    index.plan([1, 2, 3])
-    index.plan([1])  # 1 visited
-    index.plan([4])  # evicts oldest unvisited (2); 1's bit is cleared on the sweep
-    assert 1 in index and 2 not in index and 3 in index and 4 in index
-    index.plan([5])  # hand continues from 3: 3 unvisited -> evicted
-    assert 1 in index and 3 not in index and 4 in index and 5 in index
-    index.plan([1, 1, 6])  # duplicates count once per position, fetch once
-    assert index.hits == 1 + 2 and 6 in index and 1 in index
-
-
-def test_s3fifo_small_queue_promotes_hits_and_ghosts_re_admit():
-    """Hand-checked libCacheSim sequence over a 10-row cache (S 1, M 9, G 9).
-
-    Mirrors S3FIFO.c exactly: pre-first-eviction, a full S admits newcomers to
-    M (``has_evicted`` fast path); promotion needs ``move-to-main-threshold=2``
-    and keeps the counter; one-hit S rows demote to ghosts; a miss on a ghost
-    is admitted straight into M; the M clock spends one credit per chance.
+    The tier (and the ``auto`` that resolved to it on discrete GPUs) left
+    with the multi-policy experiment; a stale manifest must fail loudly
+    rather than silently switch layout.
     """
-    from b12x.sequence._shared.row_cache import S3FifoIndex
-
-    index = S3FifoIndex(10)
-    assert index._small_cap == 1 and index._main_cap == 9 and index._ghost_cap == 9
-
-    # Fill: 1 earns one hit in S; the has_evicted fast path then sends every
-    # newcomer to M, so S keeps exactly the row that has not been recycled.
-    index.insert(1)
-    index.get(1)
-    index.insert(2)
-    index.get(2)
-    for key in range(3, 11):
-        index.insert(key)
-    assert [index._key[slot] for slot in index._small] == [1]
-    assert [index._key[slot] for slot in index._main] == list(range(2, 11))
-    assert not index._ghost and not index._has_evicted
-
-    # First eviction: S's front had a single hit -- below threshold -- so it
-    # demotes to a ghost and the newcomer takes S.
-    index.insert(11)
-    assert index._has_evicted
-    assert [index._key[slot] for slot in index._small] == [11]
-    assert list(index._ghost) == [1]
-
-    # A zero-credit S row demotes too, and its ghost entry queues behind 1's.
-    index.insert(12)
-    assert [index._key[slot] for slot in index._small] == [12]
-    assert list(index._ghost) == [1, 11]
-
-    # Re-inserting a ghost skips S entirely and joins M's tail: the pending
-    # insert is counted into M's overfill test (C parent loop), so M -- not S
-    # -- pays: the clock spends 2's earned credit on one chance and evicts 3
-    # (no credit). 12, S's front, stays.
-    index.insert(1)
-    assert [index._key[slot] for slot in index._small] == [12]
-    assert [index._key[slot] for slot in index._main] == [
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        2,
-        1,
-    ]
-    assert index._freq[index._slot[2]] == 0
-    assert 3 not in index and 1 not in index._ghost
-    assert len(index) == 10
-
-    # Threshold promotion keeps the counter: on a fresh cache, 1 read twice
-    # earns a stay in M -- at full strength -- where the zero-credit front of
-    # M is the row that pays for the next admission.
-    index = S3FifoIndex(10)
-    index.insert(1)
-    index.get(1)
-    index.get(1)
-    index.insert(2)
-    index.get(2)
-    for key in range(3, 11):
-        index.insert(key)
-    index.insert(11)
-    assert index._freq[index._slot[1]] == 2
-    assert [index._key[slot] for slot in index._main] == [
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        1,
-        2,
-    ]
-    assert [index._key[slot] for slot in index._small] == [11]
-
-    # A reserved prefetch row is invisible until confirm. The reservation is
-    # the miss that pays for the slot: with S's only row (11, no credit) still
-    # queued, the eviction demotes it to a ghost, and 77 -- no ghost -- takes
-    # S, exactly where the C's plain-path insert would land it.
-    slot = index.reserve(77)
-    assert index.get(77) is None and 77 not in index
-    assert index.confirm(slot) == slot
-    assert index._queue[slot] == S3FifoIndex._SMALL
-    assert [index._key[s] for s in index._small] == [77]
-    assert 11 in index._ghost and index.is_ready(77)
+    monkeypatch.delenv("B12X_ROW_CACHE_TIER", raising=False)
+    host_rows = _host_rows(_payloads())
+    with pytest.raises(ValueError, match="B12X_ROW_CACHE_TIER.*was removed"):
+        _cache(cache_rows=8, cache_tier=tier, host_rows=host_rows)
+    monkeypatch.setenv("B12X_ROW_CACHE_TIER", tier)
+    with pytest.raises(ValueError, match="B12X_ROW_CACHE_TIER.*was removed"):
+        _cache(cache_rows=8, host_rows=host_rows)
 
 
-def test_s3fifo_churn_keeps_every_slot_owned_by_one_row():
-    """Randomised access over both queues: budgets hold, no slot gains a second
-    owner, and a batch reads its hits before its own stores land."""
-    from b12x.sequence._shared.row_cache import S3FifoIndex
-
-    index = S3FifoIndex(64)
-    # What DiskRowCache would have written into each pool row, so a hit slot
-    # quietly reassigned within the batch fails the read below rather than
-    # serving another row's bytes.
-    pool: dict[int, int] = {}
-    rng = random.Random(1234)
-    hot = [7, 8, 150, 151, 289, 6, 290, 2**40]
-    for batch in range(200):
-        ids = [
-            rng.choice(hot) if rng.random() < 0.6 else rng.randrange(300)
-            for _ in range(rng.choice([1, 5, 17, 40]))
-        ]
-        plan = index.plan(ids)
-        for position, slot in zip(plan.hit_pos, plan.hit_slot):
-            assert pool.get(slot) == ids[position]
-        for slot, row in zip(plan.store_slot, plan.store_row):
-            pool[slot] = plan.miss_ids[row]
-        assert len(index._small) <= index._small_cap
-        assert len(index._main) <= index._main_cap
-        assert len(index._ghost) <= index._ghost_cap
-        assert not set(index._small) & set(index._main)
-        assert set(index._slot.values()) == set(index._small) | set(index._main)
-        assert len(set(index._slot.values())) == len(index._slot)
-        assert (
-            len(index._free) + len(set(index._slot.values())) + len(index._loading)
-            == index._used
-        )
-        for key, slot in index._slot.items():
-            assert index._key[slot] == key
-            assert index._state[slot] == S3FifoIndex._READY
-            assert index._freq[slot] <= 3
-        for key, slot in index._loading.items():
-            # A prefetch in flight is invisible and out of every pop's reach.
-            assert key not in index
-            assert index._state[slot] == S3FifoIndex._LOADING
-            assert slot not in index._small and slot not in index._main
-        if batch % 7 == 3:
-            key = 1000 + batch
-            slot = index.reserve(key)
-            if slot is not None:
-                assert index.get(key) is None and not index.is_ready(key)
-                if batch % 3 == 0:
-                    index.cancel(slot)
-                    assert slot in index._free
-                else:
-                    pool[slot] = key
-                    assert index.confirm(slot) == slot
-                    assert index.is_ready(key)
+def test_removed_policy_knob_raises(monkeypatch):
+    """``B12X_ROW_CACHE_POLICY`` is gone: setting it names the removal."""
+    host_rows = _host_rows(_payloads())
+    monkeypatch.setenv("B12X_ROW_CACHE_POLICY", "s3fifo")
+    with pytest.raises(ValueError, match="B12X_ROW_CACHE_POLICY was removed"):
+        _cache(cache_rows=8, cache_tier="host", host_rows=host_rows)
+    monkeypatch.setenv("B12X_ROW_CACHE_POLICY", "lru")
+    with pytest.raises(ValueError, match="B12X_ROW_CACHE_POLICY was removed"):
+        _cache(cache_rows=0, host_rows=host_rows)
 
 
-def test_s3fifo_policy_selected_by_env_or_argument(monkeypatch):
-    """Env picks the policy, the argument beats it, and an unknown name fails.
+def test_s3fifo_c_index_selected_and_stats_report_host(monkeypatch):
+    """Construction wires the C S3-FIFO facade and stats carry its shape.
 
-    Surrounding space and case are normalised because operators set this from
-    a shell or a manifest; an unrecognised name is a construction error rather
-    than a silent fallback to the default.
+    ``stats()['row_cache_tier']`` is always ``host`` while the policy and
+    impl keys are gone with their knobs; a disabled cache reports neither
+    tier nor pool.
     """
-    from b12x.sequence._shared.row_cache import S3FifoIndex, SieveIndex
+    from b12x.sequence._shared.row_cache import S3FifoRowCache
 
     host_rows = _host_rows(_payloads())
 
@@ -606,40 +424,59 @@ def test_s3fifo_policy_selected_by_env_or_argument(monkeypatch):
         return _cache(cache_rows=8, cache_tier="host", host_rows=host_rows, **kwargs)
 
     monkeypatch.delenv("B12X_ROW_CACHE_POLICY", raising=False)
-    default = build()
+    cache = build()
     try:
-        assert type(default._index) is SieveIndex
-        assert default.stats()["row_cache_policy"] == "sieve"
+        assert type(cache._index) is S3FifoRowCache
+        stats = cache.stats()
+        assert stats["row_cache_tier"] == "host"
+        assert stats["row_cache_rows"] == 8
+        assert stats["row_cache_bytes"] == 8 * 266
+        assert "row_cache_policy" not in stats
     finally:
-        default.close()
+        cache.close()
 
-    monkeypatch.setenv("B12X_ROW_CACHE_POLICY", "  S3Fifo ")
-    selected = build()
-    try:
-        assert type(selected._index) is S3FifoIndex
-        assert selected.stats()["row_cache_policy"] == "s3fifo"
-    finally:
-        selected.close()
-    forced = build(policy="SIEVE")
-    try:
-        assert type(forced._index) is SieveIndex
-        assert forced.stats()["row_cache_policy"] == "sieve"
-    finally:
-        forced.close()
-    with pytest.raises(ValueError, match="B12X_ROW_CACHE_POLICY"):
-        build(policy="lru")
-    monkeypatch.setenv("B12X_ROW_CACHE_POLICY", "lru")
-    with pytest.raises(ValueError, match="B12X_ROW_CACHE_POLICY"):
-        build()
-
-    # A disabled cache reports no policy, exactly as it reports no tier.
+    # A disabled cache reports no tier, exactly as it reported no policy.
     uncached = _cache(cache_rows=0, cache_tier="host", host_rows=host_rows)
     try:
         assert uncached._index is None
-        assert uncached.row_cache_policy is None
-        assert "row_cache_policy" not in uncached.stats()
+        assert uncached.cache_tier is None
+        assert "row_cache_tier" not in uncached.stats()
     finally:
         uncached.close()
+
+
+def test_enabled_without_size_defaults_to_1gib(monkeypatch):
+    """Any row-cache knob set non-empty with no size selects the 1 GiB pool,
+    rounded down to whole rows (257 + 9 B/row here), on the C path.
+
+    Explicit ``cache_rows`` args and BYTES/ROWS values are unaffected (the
+    precedence tests for the pure helper live in
+    ``test_row_cache_policies.py``).
+    """
+    from b12x.sequence._shared.row_cache import S3FifoRowCache
+
+    for key in ("B12X_ROW_CACHE_ROWS", "B12X_ROW_CACHE_BYTES", "B12X_ROW_CACHE_POLICY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("B12X_ROW_CACHE_TIER", "host")
+    cache = _cache(host_rows=_host_rows(_payloads()))
+    try:
+        assert cache.cache_rows == (1 << 30) // 266
+        assert type(cache._index) is S3FifoRowCache
+        stats = cache.stats()
+        assert stats["row_cache_rows"] == cache.cache_rows
+        assert stats["row_cache_bytes"] == cache.cache_rows * 266
+        assert stats["row_cache_tier"] == "host"
+    finally:
+        cache.close()
+
+    # ROWS=0 is an explicit size and keeps the cache off.
+    monkeypatch.setenv("B12X_ROW_CACHE_ROWS", "0")
+    off = _cache(host_rows=_host_rows(_payloads()))
+    try:
+        assert off.cache_rows == 0
+        assert off._index is None
+    finally:
+        off.close()
 
 
 @pytest.mark.parametrize(
@@ -708,7 +545,7 @@ def test_row_cache_bytes_env_selects_capacity(monkeypatch):
 def test_cache_requires_io_uring_or_host_source(monkeypatch):
     monkeypatch.setenv("B12X_DISK_BACKEND", "gds")
     with pytest.raises(ValueError, match="GDS backend does not support a row cache"):
-        _cache(cache_rows=8, cache_tier="device")
+        _cache(cache_rows=8, cache_tier="host")
 
 
 def _host_rows(payloads):
@@ -766,9 +603,9 @@ def _wait_loading(cache, ids, timeout=3.0):
     index = cache._index
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if cache._prefetch_queue.empty() and all(gid in index._loading for gid in ids):
+        loading = index.debug_state()["loading"]
+        if cache._prefetch_queue.empty() and all(gid in loading for gid in ids):
             return
-        time.sleep(0.005)
     raise AssertionError(f"ids never entered loading: {ids}")
 
 
@@ -779,7 +616,7 @@ def _wait_jobs(cache, record, at_least, timeout=3.0):
         if (
             len(record) >= at_least
             and cache._prefetch_queue.empty()
-            and not index._loading
+            and not index.debug_state()["loading"]
         ):
             return
         time.sleep(0.005)
@@ -842,10 +679,10 @@ def test_prefetch_ready_hits_after_drain(monkeypatch):
         cache.close()
 
 
-def _assert_loading_slot_immune(monkeypatch, policy, cache_rows):
+def _assert_loading_slot_immune(monkeypatch, cache_rows):
     """A row a prefetch is still fetching is invisible and never a victim.
 
-    ``cache_rows`` is policy-sized: S3-FIFO keeps only its small-queue budget
+    ``cache_rows`` is sized for S3-FIFO: it keeps only its small-queue budget
     of rows that have not earned a second read yet, so 32 rows (S = 3) is the
     smallest cache that can hold all three prefetched ids once the
     synchronous batch has run through S.
@@ -855,30 +692,27 @@ def _assert_loading_slot_immune(monkeypatch, policy, cache_rows):
     gate = threading.Event()
     monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads, block=gate))
     cache = _cache(
-        cache_rows=cache_rows,
-        cache_tier="host",
-        host_rows=_host_rows(payloads),
-        policy=policy,
+        cache_rows=cache_rows, cache_tier="host", host_rows=_host_rows(payloads)
     )
     try:
         cache.freeze()
-        assert cache.stats()["row_cache_policy"] == policy
         loading_ids = [7, 8, 9]
         assert cache.prefetch(loading_ids) is True
         _wait_loading(cache, loading_ids)
-        slots = {gid: cache._index._loading[gid] for gid in loading_ids}
+        slots = cache._index.debug_state()["loading"]
+        assert set(slots) == set(loading_ids)
         # Synchronous misses must evict committed rows, never a loading one.
         with cache._lock:
             plan = cache._index.plan([100, 101, 102, 103, 104, 105, 106, 107, 108])
         assert len(plan.miss_ids) == 9
-        assert len(cache._index._slot) > 0
+        assert len(cache._index.debug_state()["ready"]) > 0
         # A store slot is a row this batch owns; a loading slot is in neither
         # queue, so the two can never name the same pool row.
         assert set(plan.store_slot).isdisjoint(slots.values())
         for gid in loading_ids:
-            assert gid in cache._index._loading
+            assert gid in cache._index.debug_state()["loading"]
             assert not cache._index.is_ready(gid)
-            assert cache._index._loading[gid] == slots[gid]
+            assert cache._index.debug_state()["loading"][gid] == slots[gid]
         gate.set()
         _drain(cache, loading_ids)
         assert all(cache._index.is_ready(gid) for gid in loading_ids)
@@ -888,13 +722,8 @@ def _assert_loading_slot_immune(monkeypatch, policy, cache_rows):
 
 
 @torch.inference_mode()
-def test_loading_slot_immune_to_eviction(monkeypatch):
-    _assert_loading_slot_immune(monkeypatch, "sieve", 6)
-
-
-@torch.inference_mode()
 def test_s3fifo_loading_slot_immune_to_eviction(monkeypatch):
-    _assert_loading_slot_immune(monkeypatch, "s3fifo", 32)
+    _assert_loading_slot_immune(monkeypatch, 32)
 
 
 def test_duplicate_invalid_noop(monkeypatch):
@@ -959,7 +788,7 @@ def test_rejected_prefetch_sync_identical(monkeypatch):
         # A rejected prefetch leaves nothing cached and nothing in flight.
         for gid in ids:
             assert not cache._index.is_ready(gid)
-            assert gid not in cache._index._loading
+            assert gid not in cache._index.debug_state()["loading"]
         host_ids = torch.tensor(ids, dtype=torch.int64)
         with cache.transaction():
             cache.read_rows(host_ids.to(cache.device), len(ids))

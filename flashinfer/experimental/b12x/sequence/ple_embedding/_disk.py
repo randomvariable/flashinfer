@@ -16,8 +16,9 @@ class DiskTable:
     """Own PLE row sources and decode a compact batch cache outside graphs.
 
     Rows come from checkpoint shards (``add_shard``) or, with ``host_rows``,
-    from this TP shard's rows already resident in host RAM. ``cache_rows`` and
-    ``cache_tier`` configure the SIEVE row cache; see ``DiskRowCache``.
+    from this TP shard's rows already resident in host RAM. ``cache_rows``
+    and ``cache_tier`` configure the host-tier C S3-FIFO row cache; see
+    ``DiskRowCache``.
     """
 
     def __init__(

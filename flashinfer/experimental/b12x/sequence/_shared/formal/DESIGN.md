@@ -1,14 +1,20 @@
-# Zero-copy SIEVE row cache for disk-resident PLE / Engram tables
+# Row cache for disk-resident PLE / Engram tables
 
 Design + formal-model artifact for `DiskRowCache` (`../disk_table.py`) and
-`SieveIndex` (`../row_cache.py`). Status: **implemented in Python (opt-in, off by
-default); the C/zero-copy reclamation path is NOT built. Its gate is
-§6/§8: the prefill exposure measurement landed (§8 — host work overlapped,
-no win today), the GB10 ARM Python constant is open. The correctness of its
-central invariant is
-proven (see `results.md`). The full policy set (SIEVE / S3-FIFO / W-TinyLFU),
-their libCacheSim reference-parity gates, and the measured comparison at the
-operating capacity are in [`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md).
+the row-cache index (`../row_cache.py` → the C extension
+`b12x/loader/_row_cache.c`). Status: **implemented in C (host tier), single
+S3-FIFO implementation; end-to-end sweep-validated (§9: +4.4 % decode, +7.6 %
+at c>=8, +5.8 gsm8k at 100k rows); off by default, and the 1 GiB default is
+disfavored by §9**; the SIEVE and W-TinyLFU
+Python indices and the policy knob were removed as experiments — the
+measured comparison that justifies it is the decision record
+[`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md), and the Python S3-FIFO
+class survives as the per-request parity oracle `_PyS3FifoReference` in
+`tests/.../test_row_cache_policies.py`. The §2 **zero-copy reclamation path
+(decode gathering straight from the pool, misses DMA'ing into slots) is NOT
+built**: its gate is §6/§8 — the prefill exposure measurement landed (§8 —
+host work overlapped, no win today), the GB10 ARM Python constant is open.
+The correctness of its central invariant is proven (see `results.md`).
 
 ## 1. Problem
 
@@ -25,12 +31,14 @@ of reads are repeats, the top 1 % of rows carry 42 %, and ~72 % of distinct rows
 are read exactly once. A small persistent row cache can skip most of the
 re-reads.
 
-The Python SIEVE cache added this session (tier `host`, `B12X_ROW_CACHE_ROWS`)
-resolves ids→slots in Python per step, then copies hit rows `pool[slot] →
-staging[i]`. Measured cost of `_read_cached` on the board fits
-**8.4 µs + 181 ns/id**. At decode batch sizes (n≈24–64) that is ≤20 µs/step —
-irrelevant. At prefill chunk sizes (n = tokens×head_count, up to 96304) it is
-**~17 ms/step of Python**, which is where the added latency lands.
+The Python cache measured this session (SIEVE then, tier `host`,
+`B12X_ROW_CACHE_ROWS`) resolved ids→slots in Python per step, then copied
+hit rows `pool[slot] → staging[i]`. Measured cost of `_read_cached` on the
+board fits **8.4 µs + 181 ns/id**. At decode batch sizes (n≈24–64) that is
+≤20 µs/step — irrelevant. At prefill chunk sizes (n = tokens×head_count, up
+to 96304) it is **~17 ms/step of Python**, which is where the added latency
+lands. This per-id term is what the shipped C index removes from the hot
+path; the §8 numbers predate the port and remain the pre-port baseline.
 
 ## 2. Zero-copy design (the proposed C path — not yet built)
 
@@ -48,10 +56,14 @@ it, so hits move no bytes and misses DMA straight into their final slot:
   the staging buffer. This unifies the disk path with the existing resident
   (`table_memory in {device, mapped_host}`) gather, which already indexes the
   table by id.
-- **C owns the plan.** Hit/miss resolution (`SieveIndex`) runs in C inside
-  `_ple_reader.c`: open-addressed key→slot map, FIFO queue + hand + visited bit,
-  writing `slot[]` and the miss id list, then submitting the miss wave. This
-  removes the 181 ns/id Python term entirely.
+- **C owns the plan.** Hit/miss resolution runs in C. That bullet is now
+  **partly shipped**: the replacement policy and all per-id bookkeeping are
+  the separate extension `_row_cache.c` (`S3FifoRowCache`), not code inside
+  `_ple_reader.c` — the io_uring reader and its `ple_reader_run` submit path
+  are unchanged, and the miss wave still stages through the bounce buffer
+  until the full zero-copy design lands. The open-addressed map, queues and
+  miss-id list this bullet described are exactly what the extension does;
+  the 181 ns/id Python term is gone from the cached read path.
 
 ### Placements (the three architectures)
 
@@ -61,8 +73,9 @@ it, so hits move no bytes and misses DMA straight into their final slot:
 | Discrete GPU (SM120/100) | disk | host-RAM pool | host copy to device slot | DMA → host slot, 1× H2D |
 | Discrete GPU, table in host RAM | host table | VRAM pool | kernel reads VRAM slot | H2D → VRAM slot |
 
-`row_cache.py`/`disk_table.py` today implement the two host-pool tiers and the
-host-table source; only the **C plan + direct-DMA-into-pool-slot** is unbuilt.
+`row_cache.py`/`disk_table.py` today implement the host-pool tier (the only
+tier left) and the host-table source; the **direct-DMA-into-pool-slot**
+half of this section is unbuilt.
 
 ## 3. The one dangerous invariant — and its proof
 
@@ -70,9 +83,10 @@ Everything is bookkeeping except this: **a slot an outstanding decode is
 gathering from must never be recycled (freed → reallocated to a different row)
 until that decode has retired.** With a batch-sized staging buffer this is free
 (overwrite on the next step is fenced by the step's event). With a persistent
-pool it is a real deferred-reclamation protocol: the SIEVE hand may pick a
-victim that is `inflight == ∅` per the last step but a still-in-flight captured
-decode from the *previous* step is reading it.
+pool it is a real deferred-reclamation protocol: the replacement pop (any
+`_release` path in the C index) may pick a victim that is `inflight == ∅`
+per the last step but a still-in-flight captured decode from the *previous*
+step is reading it.
 
 This is modelled as an epoch/RCU reclamation and proven in Quint + Apalache
 (`slotpool.qnt`, evidence in `results.md`):
@@ -84,17 +98,24 @@ This is modelled as an epoch/RCU reclamation and proven in Quint + Apalache
   Apalache returns a concrete 5-state **counterexample** where a reader still
   references a slot that has been reset to free — the checker rejects it.
 
-The `DEFER_FREE` boolean is the exact code-level knob: `free_slot` in
-`row_cache.py`/`disk_table.py` must carry the `inflight == ∅ ∧ no-reader-references`
-guard, and the retirement path must clear a slot's `inflight` only after the
-reading decode's CUDA event retires. That guard is what the proof pins.
+The `DEFER_FREE` boolean is the exact code-level knob: the release paths
+(`rc_release` in `_row_cache.c`, reached only from queue pops under
+`DiskRowCache._lock`) must carry the `inflight == ∅ ∧ no-reader-references`
+guard, and the retirement path must clear a slot's `inflight` only after
+the reading decode's CUDA event retires. In the shipped code that guard is
+the transaction discipline: `transaction()` holds `_lock` across plan,
+fetch, store and decode, records `_cache_done` on exit, and the next
+transaction's `stream.wait_event(self._cache_done)` fences every reuse of a
+slot this batch staged from. That guard is what the proof pins; the C port
+preserves it unchanged.
 
 ## 4. What the formal model does NOT cover
 
-- SIEVE eviction *quality* (hit-rate optimality) — that is the paper's claim, not
+- S3-FIFO eviction *quality* (hit-rate optimality) — that is the paper's claim, not
   verified here; only structural correctness of the lifecycle is proven.
-- The Triton gather kernel's byte-level correctness — covered by the 25
-  byte-identity unit tests in `test_disk_row_cache.py`.
+- The Triton gather kernel's byte-level correctness — covered by the
+  byte-identity unit tests in `test_disk_row_cache.py` (and, for the index
+  itself, the per-request C-vs-oracle parity in `test_row_cache_policies.py`).
 - Real CUDA event ordering / driver semantics — the model abstracts the
   outstanding-reader set (`reading`) and inflight sets; the implementation must
   honour the same protocol with per-step `Event`s.
@@ -106,8 +127,9 @@ reading decode's CUDA event retires. That guard is what the proof pins.
    --inductive-invariant=IndInv` → `[ok]` (unbounded).
 2. `quint verify slotpool.qnt --main broken --invariant=NoUseAfterFree` →
    `[violation]` (negative test; proves the gate is non-vacuous).
-3. `test_disk_row_cache.py` byte-identity suite green on GB10 across both tiers
-   and both sources (already green: 25 passed).
+3. `test_disk_row_cache.py` byte-identity suite green on GB10 across the
+   host tier and both sources (25 arms pre-port; the device-tier arms were
+   retired with the tier and became ``ValueError`` regression tests).
 
 ## 6. Performance verdict (measured, 2026-10-09)
 
@@ -209,11 +231,12 @@ Revisions and additions to the §6 verdict:
    arm order.
 
 Not measured here: the `s3fifo` policy and the in-b12x `B12X_PLE_PREFETCH`
-worker path end-to-end (both postdate the tree under test). Offline replay of
-all three policies on the production traces is now measured and gate-verified
-against libCacheSim in [`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md);
-re-run this sweep matrix on the branch head before quoting end-to-end policy
-or worker numbers.
+worker path end-to-end (both postdate the tree under test; the tree under
+test also predates the C port — its arms were Python indices). Offline
+replay is gate-verified against libCacheSim in
+[`ROW_CACHE_POLICIES.md`](ROW_CACHE_POLICIES.md), and the shipped index is
+now the C S3-FIFO; re-run this sweep matrix on the branch head before
+quoting end-to-end policy or worker numbers.
 
 Not measured: WSL2 SM120 (end-user board); single boots for 5m/ram arms
 (ceiling direction is unambiguous, magnitude ±3 %).
@@ -290,3 +313,48 @@ no board in the last two rows has run this stack. The *decision* it supports:
 on the 600 W part, do not build the C port; on Vera-class hardware the per-id
 host constant, not the GPU, sets whether prefill is host-bound, and that
 number must be measured on the actual host before the gate can flip.
+
+## 9. C-path concurrency sweep: c100k wins, the 1 GiB default does not (server21, 2026-10-11)
+
+The §7 protocol applied to the shipped C implementation (whole PR tree
+bind-mounted over the image's `b12x`, `B12X_ROW_CACHE_POLICY`/tier removed,
+C extension JIT-built inside the container): cloned production spec, GPU
+frozen off serving, full lil-bench sweep `--concurrency 1,2,4,8,16` x
+`--contexts 0,16k,64k,128k`, 45 s/cell, **2 rounds reversed arm order**
+(round 1 `none,c,c100k`; round 2 `c100k,c,none`), pooled per cell, GSM8K
+c=1 profile per arm. Harness `~/ab/run_c_sweep.sh`, logs
+`~/ab/c_sweep_r{1,2}.log` on server21.
+
+| arm | decode pooled Δ vs none | c≥8 | gsm8k tok/s (pooled) | acceptance |
+|---|---|---|---|---|
+| none (disk, no cache) | baseline | baseline | 204.0 | 2.98/3.10 |
+| **c, 100k rows** | **+4.35 %** | **+7.61 %** | **209.8** | 3.01 |
+| c, 1 GiB default | −0.49 % | ≈ −1 % | 202.6 | 3.04-3.07 |
+
+Readings:
+
+1. **The C port lands the throughput the Python host tier promised and then
+   some**: +4.35 % pooled (+7.6 % at c>=8) and +5.8 gsm8k tok/s at 100k
+   rows, vs the Python arms' +3.4-3.6 % (§7). Round-to-round spread 3.1 %
+   mean-abs per cell keeps the c=1 delta (pooled +0.1 %) within noise, so
+   the gain is genuinely the high-concurrency regime where the io_uring miss
+   wave and pool copies crowd the step thread.
+2. **The 1 GiB default (11.9 M rows) is a regression: −0.5 % vs no cache,
+   −4.6 % vs 100k.** §6/§7's "size is not the lever" held only inside the
+   100k-317k band; beyond the ~317k-row working set the pool goes
+   pathologically wrong — every ghost admission targets an empty M (no clock
+   pressure), and S's one-hit filter now shelters long-dead rows against a
+   queue that never recycles (the S=10 % / 1.19 M-row regime has no eviction
+   signal at all at this trace's reuse depth). Direction was consistent
+   across both rounds; magnitude sits near the noise floor, but the *sign*
+   (1 GiB < 100k) is the decision-relevant half and reproduces.
+3. **Decision owed (user's call, recorded here)**: the sweep supports an
+   explicit ~100k-row / 8.6 MiB class as the recommended size on SM120. If a
+   default is wanted, a measured candidate is the 317k-row working-set size
+   (~28 MiB) — where all policies converged in §4 — not 1 GiB; both should
+   go through this same two-round sweep before shipping as a default.
+4. Arm `c` here means the C index at the given size (policy is fixed); the
+   `c` column of round 1 vs 2 (152.5/161.1 at 0@1) shows boot-order noise of
+   the same size as the 1 GiB penalty, which is why the *relative* c-vs-c100k
+   comparison (−4.55 %, same-round pairs) carries the verdict, not the
+   absolute 1 GiB number.

@@ -24,13 +24,18 @@ if TYPE_CHECKING:
 # Poison pill handed to the prefetch worker's queue by ``close`` to unblock and
 # stop its daemon thread. Distinct by identity from any id list a job may hold.
 _PREFETCH_SENTINEL = object()
+# Pool size applied when the cache is enabled through the environment but no
+# size is given: 1 GiB of pool bytes, rounded down to whole rows by
+# ``_resolve_row_cache_size`` (11,930,464 rows at the shipped 90 B/row PLE
+# geometry). The row-cache knobs are the only way to enable the cache from a
+# shell or manifest; the shipped implementation is one host-tier C S3-FIFO
+# (``row_cache.S3FifoRowCache``). The former ``B12X_ROW_CACHE_POLICY`` and the
+# ``device``/``auto`` tiers were removed with the multi-policy experiment —
+# the measured comparison that retired them is kept as the rationale in
+# ``formal/ROW_CACHE_POLICIES.md`` — and setting them is a construction error
+# that names the knob.
+_ROW_CACHE_DEFAULT_BYTES = 1 << 30
 
-# Row-cache replacement policies, and the value of ``B12X_ROW_CACHE_POLICY``
-# accepted at construction. ``s3fifo`` selects the S3-FIFO sibling and
-# ``wtinylfu`` the W-TinyLFU sibling of ``SieveIndex``; all own the same slot
-# pool and the same plan/reserve contract, so nothing below the index is
-# policy-aware.
-_ROW_CACHE_POLICIES = ("sieve", "s3fifo", "wtinylfu")
 
 # Suffixes accepted by ``B12X_ROW_CACHE_BYTES``, as multipliers of the decimal
 # amount. A bare number is plain bytes.
@@ -74,6 +79,66 @@ def _parse_row_cache_size(text: str, row_bytes: int) -> int:
             f"B12X_ROW_CACHE_BYTES={text!r} rounds to zero rows at {row_bytes} B/row"
         )
     return int(size) // row_bytes
+
+
+def _resolve_row_cache_size(
+    size_env: str | None, rows_env: str | None, tier_env: str | None, row_bytes: int
+) -> tuple[int, bool]:
+    """Return ``(cache_rows, size_defaulted)`` for the environment size knobs.
+
+    Precedence: ``B12X_ROW_CACHE_BYTES`` > ``B12X_ROW_CACHE_ROWS`` > the 1 GiB
+    default > 0 (off). The cache counts as *enabled* when any of
+    ``B12X_ROW_CACHE_BYTES``, ``B12X_ROW_CACHE_ROWS`` or
+    ``B12X_ROW_CACHE_TIER`` is set to a non-empty value; enabled without a
+    size selects ``_ROW_CACHE_DEFAULT_BYTES`` of pool bytes, rounded *down*
+    to whole rows, so a 1 GiB budget costs ``(1 << 30) // row_bytes *
+    row_bytes`` bytes. ``B12X_ROW_CACHE_ROWS=0`` is an explicit size and keeps
+    the historical off-by-default behaviour. A default that would round to
+    zero rows (a row larger than the budget) is a construction error, never a
+    silently disabled cache.
+    """
+    if size_env is not None and rows_env is not None:
+        raise ValueError("set only one of B12X_ROW_CACHE_ROWS / B12X_ROW_CACHE_BYTES")
+    if size_env is not None:
+        return _parse_row_cache_size(size_env, row_bytes), False
+    if rows_env is not None and rows_env != "":
+        return int(rows_env), False
+    enabled = any(
+        value is not None and value != "" for value in (size_env, rows_env, tier_env)
+    )
+    if not enabled:
+        return 0, False
+    rows = _ROW_CACHE_DEFAULT_BYTES // row_bytes
+    if rows <= 0:
+        raise ValueError(
+            f"1 GiB row-cache default rounds to zero rows at {row_bytes} "
+            "B/row; set B12X_ROW_CACHE_BYTES explicitly"
+        )
+    return rows, True
+
+
+def _validate_row_cache_tier(cache_tier: str | None) -> str:
+    """Normalise the cache tier; only ``host`` (and unset) survive.
+
+    ``device`` and ``auto`` named the device-resident tier that measured
+    slower than no cache on discrete GPUs (``formal/DESIGN.md`` §7) and whose
+    Python index was deleted with the multi-policy experiment. The error
+    names the removed knob so an operator migrating from the experiments is
+    told why, instead of silently getting a different layout.
+    """
+    if cache_tier is None or cache_tier == "":
+        return "host"
+    value = cache_tier.strip().lower()
+    if value == "host":
+        return "host"
+    if value in ("device", "auto"):
+        raise ValueError(
+            f"B12X_ROW_CACHE_TIER={cache_tier!r} was removed: the row cache is "
+            "host-tier only (the device tier measured slower than no cache on "
+            "discrete GPUs and its Python index was deleted with the "
+            "multi-policy experiment); unset it or use 'host'"
+        )
+    raise ValueError("cache_tier must be host ('device'/'auto' were removed)")
 
 
 def _check_cuda(error: cudart.cudaError_t, operation: str) -> None:
@@ -194,29 +259,38 @@ class DiskRowCache:
 
     Rows come from checkpoint shards via io_uring/GDS, or from ``host_rows``:
     CPU tensors holding this shard's rows ``[shard_start, shard_end)`` in id
-    order. An optional row cache (``cache_rows`` > 0, policy ``sieve`` or
-    ``s3fifo``) keeps recently read rows so repeated n-grams skip the source:
+    order. The optional row cache (``cache_rows`` > 0) ships a single
+    implementation, the host-tier C S3-FIFO
+    (``row_cache.S3FifoRowCache``): recently read rows stay in host RAM so
+    repeated n-grams skip the source, and a cached batch performs no
+    per-request Python work (the plan, counters, ghost bookkeeping and row
+    copies all run inside the extension; the io_uring fetch and the CUDA
+    transaction/fence discipline are unchanged around it).
 
-    * ``cache_tier="host"`` keeps them in host memory and stages through the
-      mapped-host buffer. On unified-memory parts (GB10) this is the only copy.
-    * ``cache_tier="device"`` keeps them in device memory, stages into a device
-      buffer, and transfers only misses (discrete GPUs).
+    Configuration (read at construction; the ``cache_rows`` argument wins
+    over the environment):
 
-    Configuration (read at construction; the ``cache_*`` arguments win over
-    their environment defaults):
-
-    * ``B12X_ROW_CACHE_ROWS`` — pool capacity in rows (default ``0``, off).
+    * ``B12X_ROW_CACHE_ROWS`` — pool capacity in rows. ``0`` keeps the cache
+      off, the historical default when nothing else is set.
     * ``B12X_ROW_CACHE_BYTES`` — the same knob in pool bytes, rounded down to
       whole rows: ``8.6MiB`` == 100000 rows at 90 B/row. Mutually exclusive
       with ``B12X_ROW_CACHE_ROWS``.
-    * ``B12X_ROW_CACHE_TIER`` — ``auto`` (host on integrated GPUs, device on
-      discrete), ``host`` or ``device``. On a discrete GPU the ``auto`` default
-      selects ``device``, which measured *slower* than no cache at c=1; the
-      SM120 result supports explicit ``host`` there.
-    * ``B12X_ROW_CACHE_POLICY`` — ``sieve`` (default), ``s3fifo`` or
-      ``wtinylfu``; S3-FIFO leads at 100k rows on the production row-id trace
-      (libCacheSim replay, see ``formal/DESIGN.md``), and W-TinyLFU is the
-      cachesim-WTinyLFU-parity sibling.
+    * Enabled without a size — any of ``B12X_ROW_CACHE_BYTES``,
+      ``B12X_ROW_CACHE_ROWS`` or ``B12X_ROW_CACHE_TIER`` set to a non-empty
+      value, none naming a size — the pool defaults to 1 GiB:
+      ``(1 << 30) // row_bytes`` rows (11,930,464 at the shipped 90 B/row PLE
+      geometry; the row count rounds down to whole rows, so the pool costs
+      at most 1 GiB).
+    * ``B12X_ROW_CACHE_TIER`` — only ``host`` (or unset). ``device``/``auto``
+      were removed with the device tier; setting them raises and the error
+      names the knob.
+    * ``B12X_ROW_CACHE_POLICY`` — removed; the shipped cache is S3-FIFO only
+      and setting the variable raises, naming it. ``B12X_ROW_CACHE_IMPL``
+      never existed in the shipped tree: the C *is* the implementation, and
+      if the extension fails to build, construction raises — there is no
+      silent fallback. The A/B sweep arm for "cache off" is
+      ``B12X_ROW_CACHE_ROWS=0``; the pre-port Python-path measurements stay
+      in ``formal/DESIGN.md`` (§7/§8).
     * ``B12X_PLE_PREFETCH`` — nonzero turns the ``prefetch`` worker on. Under
       vLLM the runner hook is gated separately by ``VLLM_PLE_PREFETCH``; both
       must be set.
@@ -247,7 +321,6 @@ class DiskRowCache:
         queue_depth: int = 64,
         cache_rows: int | None = None,
         cache_tier: str | None = None,
-        policy: str | None = None,
         host_rows: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> None:
         from b12x.loader._native import load
@@ -275,50 +348,39 @@ class DiskRowCache:
         )
         if self._backend not in ("io_uring", "gds", "host"):
             raise ValueError("B12X_DISK_BACKEND must be io_uring or gds")
+        row_bytes = self.weight_row_bytes + self.scale_row_bytes
+        # ``B12X_ROW_CACHE_POLICY`` was removed with the multi-policy
+        # experiment. Setting it is rejected even for a disabled cache so a
+        # stale manifest cannot hide behind a silently ignored knob.
+        removed_policy = os.environ.get("B12X_ROW_CACHE_POLICY")
+        if removed_policy is not None and removed_policy != "":
+            raise ValueError(
+                "B12X_ROW_CACHE_POLICY was removed: the row cache ships a "
+                "single host-tier C S3-FIFO implementation "
+                "(row_cache.S3FifoRowCache); unset it"
+            )
+        tier_env = os.environ.get("B12X_ROW_CACHE_TIER")
         if cache_rows is None:
-            # ``B12X_ROW_CACHE_BYTES`` is the same knob in pool bytes (the unit
-            # ``stats()['row_cache_bytes']`` reports), because an operator
-            # reasons about a host-RAM budget in MiB, not in rows of 90 B. It
-            # is only consulted when the row count itself comes from the
-            # environment; an explicit ``cache_rows`` argument beats both.
-            row_bytes = self.weight_row_bytes + self.scale_row_bytes
+            # ``B12X_ROW_CACHE_BYTES`` is the same knob in pool bytes (the
+            # unit ``stats()['row_cache_bytes']`` reports), because an
+            # operator reasons about a host-RAM budget in MiB, not in rows of
+            # 90 B. With no size given at all, an enabled cache takes the
+            # 1 GiB default; nothing set keeps the historical off-by-default.
             size_env = os.environ.get("B12X_ROW_CACHE_BYTES")
             rows_env = os.environ.get("B12X_ROW_CACHE_ROWS")
-            if size_env is not None and rows_env is not None:
-                raise ValueError(
-                    "set only one of B12X_ROW_CACHE_ROWS / B12X_ROW_CACHE_BYTES"
-                )
-            if size_env is not None:
-                cache_rows = _parse_row_cache_size(size_env, row_bytes)
-            else:
-                cache_rows = int(rows_env or "0")
+            cache_rows = _resolve_row_cache_size(
+                size_env, rows_env, tier_env, row_bytes
+            )[0]
         cache_rows = operator.index(cache_rows)
         if cache_rows < 0:
             raise ValueError("cache_rows must be nonnegative")
-        if cache_tier is None:
-            cache_tier = os.environ.get("B12X_ROW_CACHE_TIER", "auto")
-        if cache_tier == "auto":
-            integrated = torch.cuda.get_device_properties(device).is_integrated
-            cache_tier = "host" if integrated else "device"
-        if cache_tier not in ("host", "device"):
-            raise ValueError("cache_tier must be host, device or auto")
-        if cache_rows:
-            if policy is None:
-                policy = os.environ.get("B12X_ROW_CACHE_POLICY", "sieve")
-            # Operators set this from a shell or a manifest, so surrounding space
-            # and case are not an error. An unknown name is, and it is rejected
-            # here rather than silently falling back to the default policy.
-            policy = policy.strip().lower()
-            if policy not in _ROW_CACHE_POLICIES:
-                raise ValueError(
-                    "B12X_ROW_CACHE_POLICY must be one of "
-                    + ", ".join(_ROW_CACHE_POLICIES)
-                )
+        cache_tier = _validate_row_cache_tier(
+            tier_env if cache_tier is None else cache_tier
+        )
         if cache_rows and self._backend == "gds":
             raise ValueError("the GDS backend does not support a row cache")
         self.cache_rows = cache_rows
         self.cache_tier = cache_tier if cache_rows else None
-        self.row_cache_policy = policy if cache_rows else None
         self._gds = None
         self._native = None
         self._reader = None
@@ -351,19 +413,12 @@ class DiskRowCache:
 
             self._gds = GdsRows(self, queue_depth)
             self.weight, self.scale = self._gds.weight, self._gds.scale
-        elif self.cache_tier == "device":
-            self.weight = torch.empty(
-                (self.max_lookups, self.weight_row_bytes),
-                dtype=torch.uint8,
-                device=device,
-            )
-            if self.scale_row_bytes:
-                self.scale = torch.empty(
-                    (self.max_lookups, self.scale_row_bytes),
-                    dtype=torch.uint8,
-                    device=device,
-                )
         else:
+            # Host staging through the mapped, page-locked buffer is the only
+            # non-GDS layout now that the device tier is removed: on
+            # integrated parts the pool is the only copy, and on discrete
+            # GPUs §7 measured host staging faster than device-resident
+            # caching, so the cache pool lives in host RAM next to it.
             self._weight_allocation = MappedHostAllocation(
                 (self.max_lookups, self.weight_row_bytes), torch.uint8, device
             )
@@ -419,7 +474,7 @@ class DiskRowCache:
         return weight.numpy(), (scale.numpy() if self.scale_row_bytes else None)
 
     def _init_row_cache(self) -> None:
-        from .row_cache import S3FifoIndex, SieveIndex, WTinyLfuIndex
+        from .row_cache import S3FifoRowCache
 
         rows = self.cache_rows
         widths = [self.weight_row_bytes] + (
@@ -429,13 +484,8 @@ class DiskRowCache:
         # initialize_model time), so every CPU allocation here names the device
         # explicitly; a bare torch.empty(pin_memory=True) would build a meta
         # tensor and fail "Only dense CPU tensors can be pinned".
-        index_cls = {
-            "s3fifo": S3FifoIndex,
-            "wtinylfu": WTinyLfuIndex,
-        }.get(self.row_cache_policy, SieveIndex)
-        self._index = index_cls(rows)
-        # Miss rows land here first; the CPU reads them back, so they are plain
-        # pinned memory rather than write-combined.
+        # Miss rows land here first; the CPU reads them back, so they are
+        # plain pinned memory rather than write-combined.
         self._miss_ids = torch.empty(
             (self.max_lookups,), dtype=torch.int64, device="cpu", pin_memory=True
         )
@@ -448,32 +498,43 @@ class DiskRowCache:
             )
             for width in widths
         ]
-        if self.cache_tier == "host":
-            self._pool = [
-                torch.empty((rows, width), dtype=torch.uint8, device="cpu").numpy()
-                for width in widths
-            ]
-            self._stage_host = [self.weight_host.numpy()] + (
-                [self.scale_host.numpy()] if self.scale_row_bytes else []
-            )
-        else:
-            self._pool = [
-                torch.empty((rows, width), dtype=torch.uint8, device=self.device)
-                for width in widths
-            ]
-            self._stage_device = [self.weight] + (
-                [self.scale] if self.scale_row_bytes else []
-            )
-            # hit_pos, hit_slot, miss_pos, miss_row, store_slot, store_row.
-            self._plan_host = torch.empty(
-                (6, self.max_lookups),
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-            self._plan_device = torch.empty(
-                (6, self.max_lookups), dtype=torch.int64, device=self.device
-            )
+        # Host tier: the pool is plain host RAM and the stage planes are views
+        # of the mapped-host weight/scale buffers. The C index binds all of
+        # them (zero-copy) for the index's lifetime, so they are allocated
+        # before the index and kept referenced by this object.
+        self._pool = [
+            torch.empty((rows, width), dtype=torch.uint8, device="cpu").numpy()
+            for width in widths
+        ]
+        self._stage_host = [self.weight_host.numpy()] + (
+            [self.scale_host.numpy()] if self.scale_row_bytes else []
+        )
+        for pinned in (self.ids_host, self._miss_ids, *self._miss_planes):
+            if not pinned.is_pinned():
+                raise ValueError(
+                    "row cache id and miss buffers must be page-locked before "
+                    "binding them to the C index"
+                )
+        self._miss_ids_view = memoryview(self._miss_ids.numpy())
+        self._miss_weight_view = memoryview(self._miss_planes[0].numpy())
+        self._miss_scale_view = (
+            memoryview(self._miss_planes[1].numpy()) if self.scale_row_bytes else None
+        )
+        # Raises RuntimeError if the C extension cannot be built; the cache
+        # never silently degrades to a Python path (there is none left).
+        self._index = S3FifoRowCache(
+            rows,
+            self.max_lookups,
+            self._ids_buffer,
+            self._miss_ids_view,
+            [
+                memoryview(plane)
+                for plane in (self._miss_weight_view, self._miss_scale_view)
+                if plane is not None
+            ],
+            [memoryview(array) for array in self._stage_host],
+            [memoryview(array) for array in self._pool],
+        )
 
     def _require_open(self):
         if self._closed:
@@ -498,6 +559,11 @@ class DiskRowCache:
                     self._cache_done.synchronize()
             if self._gds is not None:
                 self._gds.close()
+            # Drop the capsule (and the buffers it holds) before the mapped
+            # host allocations are freed underneath it.
+            if self._index is not None:
+                self._index.close()
+                self._index = None
             for allocation in (self._scale_allocation, self._weight_allocation):
                 if allocation is not None:
                     allocation.close()
@@ -665,20 +731,16 @@ class DiskRowCache:
                 for _, slot in reserved:
                     index.cancel(slot)
                 return
-            if self.cache_tier == "host":
-                for row, (_, slot) in enumerate(reserved):
-                    if index._state[slot] != index._LOADING:
-                        continue
-                    for plane, pool in zip(planes, self._pool):
-                        pool[slot] = plane[row]
-            else:
-                with torch.cuda.device(self.device):
-                    for row, (_, slot) in enumerate(reserved):
-                        if index._state[slot] != index._LOADING:
-                            continue
-                        for plane, pool in zip(planes, self._pool):
-                            pool[slot].copy_(torch.from_numpy(plane[row]))
-                    torch.cuda.current_stream(self.device).synchronize()
+            # Host tier only now: write the fetched bytes into the reserved
+            # slots (skipping any the synchronous path already adopted or
+            # cancelled) and publish them, all under _lock. confirm() is
+            # idempotent, so adopting a slot the batch already committed is a
+            # no-op, exactly as with the Python index.
+            for row, (_, slot) in enumerate(reserved):
+                if not index.is_loading(slot):
+                    continue
+                for plane, pool in zip(planes, self._pool):
+                    pool[slot] = plane[row]
             for _, slot in reserved:
                 index.confirm(slot)
 
@@ -816,67 +878,24 @@ class DiskRowCache:
             out[valid] = table[rows]
 
     def _read_cached(self, count: int) -> None:
-        plan = self._index.plan(self.ids_host[:count].tolist())
-        misses = len(plan.miss_ids)
+        # One C call resolves the batch: lookups, counter/ghost/queue
+        # mutation, admission evictions, and the hit copies from pool into the
+        # bound staging planes. Miss ids land in the bound pinned buffer; the
+        # io_uring fetch (unchanged, still through _fetch) reads the distinct
+        # miss wave into the bound miss planes; store() then stages misses and
+        # writes pool stores. Hits are staged before any store of the same
+        # batch, so an eviction made for this batch never clobbers a row the
+        # batch still reads (RowPlan; DESIGN.md §3), and the transaction's
+        # _cache_done fence still gates pool reuse across the decode.
+        _, misses = self._index.read(count)
         if misses:
-            self._miss_ids[:misses] = torch.tensor(plan.miss_ids, dtype=torch.int64)
             self._fetch(
-                memoryview(self._miss_ids.numpy()),
-                memoryview(self._miss_planes[0].numpy()),
-                memoryview(self._miss_planes[1].numpy())
-                if self.scale_row_bytes
-                else None,
+                self._miss_ids_view,
+                self._miss_weight_view,
+                self._miss_scale_view,
                 misses,
             )
-        if self.cache_tier == "host":
-            for stage, pool, fetched in zip(
-                self._stage_host, self._pool, self._miss_planes
-            ):
-                fetched = fetched.numpy()
-                # Hits read the pool before any store can reuse their slots.
-                if plan.hit_pos:
-                    stage[plan.hit_pos] = pool[plan.hit_slot]
-                if misses:
-                    stage[plan.miss_pos] = fetched[plan.miss_row]
-                    pool[plan.store_slot] = fetched[plan.store_row]
-            return
-        lists = (
-            plan.hit_pos,
-            plan.hit_slot,
-            plan.miss_pos,
-            plan.miss_row,
-            plan.store_slot,
-            plan.store_row,
-        )
-        host = self._plan_host.numpy()
-        for row, values in enumerate(lists):
-            host[row, : len(values)] = values
-        width = max(map(len, lists))
-        stream = self._transaction_stream
-        with torch.cuda.stream(stream):
-            index = self._plan_device[:, :width]
-            index.copy_(self._plan_host[:, :width], non_blocking=True)
-            hits = len(plan.hit_pos)
-            stores = len(plan.store_slot)
-            for stage, pool, fetched in zip(
-                self._stage_device, self._pool, self._miss_planes
-            ):
-                # Hits read the pool before any store can reuse their slots.
-                if hits:
-                    stage.index_copy_(
-                        0, index[0, :hits], pool.index_select(0, index[1, :hits])
-                    )
-                if misses:
-                    rows = fetched[:misses].to(self.device, non_blocking=True)
-                    positions = len(plan.miss_pos)
-                    stage.index_copy_(
-                        0,
-                        index[2, :positions],
-                        rows.index_select(0, index[3, :positions]),
-                    )
-                    pool.index_copy_(
-                        0, index[4, :stores], rows.index_select(0, index[5, :stores])
-                    )
+        self._index.store()
 
     def stats(self) -> dict[str, int | float]:
         self._require_open()
@@ -908,7 +927,7 @@ class DiskRowCache:
             )
             descriptors = result.get("descriptor_bytes", 0)
             result["gds_enabled"] = int(self._gds is not None)
-            device_staged = self._gds is not None or self.cache_tier == "device"
+            device_staged = self._gds is not None
             result["device_staging_bytes"] = (
                 (result["staging_bytes"] + result["cache_bytes"] + descriptors)
                 if device_staged
@@ -926,15 +945,20 @@ class DiskRowCache:
                 pool_bytes = self.cache_rows * (
                     self.weight_row_bytes + self.scale_row_bytes
                 )
-                lookups = self._index.hits + self._index.misses
+                index_stats = self._index.stats()
+                lookups = index_stats["hits"] + index_stats["misses"]
                 result.update(
                     row_cache_tier=self.cache_tier,
-                    row_cache_policy=self.row_cache_policy,
                     row_cache_rows=self.cache_rows,
-                    row_cache_resident=len(self._index),
+                    row_cache_resident=index_stats["resident"],
                     row_cache_bytes=pool_bytes,
-                    row_cache_hits=self._index.hits,
-                    row_cache_misses=self._index.misses,
-                    row_cache_hit_rate=(self._index.hits / lookups if lookups else 0.0),
+                    row_cache_hits=index_stats["hits"],
+                    row_cache_misses=index_stats["misses"],
+                    row_cache_hit_rate=(
+                        index_stats["hits"] / lookups if lookups else 0.0
+                    ),
+                    row_cache_small=index_stats["s"],
+                    row_cache_main=index_stats["m"],
+                    row_cache_ghost=index_stats["g"],
                 )
             return result
