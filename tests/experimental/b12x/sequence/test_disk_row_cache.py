@@ -563,6 +563,69 @@ def test_s3fifo_policy_selected_by_env_or_argument(monkeypatch):
         uncached.close()
 
 
+@pytest.mark.parametrize(
+    ("text", "rows"),
+    [
+        # row_bytes=90: (8.6 * 2**20) // 90 == 100197, i.e. 8.6 MiB is the
+        # capacity a 100k-row PLE pool (90 B/row) actually costs.
+        ("8.6MiB", 100_197),
+        ("8.6Mi", 100_197),
+        ("8600000", 95_555),
+        (" 1 GiB ", 11_930_464),
+        ("1G", 11_930_464),
+        ("1kib", 11),
+        ("0.5KiB", 5),
+        ("8600000B", 95_555),
+    ],
+)
+def test_row_cache_size_parses_to_whole_rows(text, rows):
+    from b12x.sequence._shared.disk_table import _parse_row_cache_size
+
+    assert _parse_row_cache_size(text, 90) == rows
+
+
+@pytest.mark.parametrize("text", ["", "MiB", "-1MiB", "1.2.3MiB", "0", "1PiB"])
+def test_row_cache_size_rejects_unusable_values(text):
+    """Malformed, sub-row and unmultipliable values are errors, not a silent off."""
+    from b12x.sequence._shared.disk_table import _parse_row_cache_size
+
+    with pytest.raises(ValueError, match="B12X_ROW_CACHE_BYTES"):
+        _parse_row_cache_size(text, 90)
+
+
+def test_row_cache_bytes_env_selects_capacity(monkeypatch):
+    """The env knob sizes the pool in bytes; explicit rows and args win cleanly."""
+    host_rows = _host_rows(_payloads())
+    monkeypatch.delenv("B12X_ROW_CACHE_ROWS", raising=False)
+    monkeypatch.delenv("B12X_ROW_CACHE_BYTES", raising=False)
+
+    monkeypatch.setenv("B12X_ROW_CACHE_BYTES", "8.6MiB")
+    cache = _cache(cache_tier="host", host_rows=host_rows)
+    try:
+        # 8.6 MiB at 257 + 9 B/row: rounds down to whole rows, never a partial slot.
+        assert cache.cache_rows == (8.6 * 2**20) // 266
+        assert cache.stats()["row_cache_rows"] == cache.cache_rows
+    finally:
+        cache.close()
+
+    # The argument is an explicit operator choice and beats the environment.
+    explicit = _cache(cache_rows=8, cache_tier="host", host_rows=host_rows)
+    try:
+        assert explicit.cache_rows == 8
+    finally:
+        explicit.close()
+
+    monkeypatch.setenv("B12X_ROW_CACHE_ROWS", "16")
+    with pytest.raises(ValueError, match="only one of"):
+        _cache(cache_tier="host", host_rows=host_rows)
+
+    # A request below one row is an error, not a silently disabled cache.
+    monkeypatch.delenv("B12X_ROW_CACHE_ROWS")
+    monkeypatch.setenv("B12X_ROW_CACHE_BYTES", "10")
+    with pytest.raises(ValueError, match="rounds to zero rows"):
+        _cache(cache_tier="host", host_rows=host_rows)
+
+
 def test_cache_requires_io_uring_or_host_source(monkeypatch):
     monkeypatch.setenv("B12X_DISK_BACKEND", "gds")
     with pytest.raises(ValueError, match="GDS backend does not support a row cache"):

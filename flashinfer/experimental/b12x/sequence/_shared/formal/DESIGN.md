@@ -142,13 +142,61 @@ Findings:
    ~20 µs/step of Python and one host memcpy — the wrong 10 %. The device tier
    additionally pays GPU `index_select`/`index_copy` work per step that zeroes
    its own miss savings at 64-row waves (measured wash).
-4. **Ship:** the Python host-tier cache as-is, opt-in, default off, pool 100k
-   rows (8.6 MiB) — a stable +4 % on prefill-heavy profiles at ~zero cost and
-   zero VRAM. **For users wanting the full disk win on SM120-class boxes, the
-   answer is `ple_table_memory=ram`** (+14 %, 26.9 GiB host RAM — affordable
-   everywhere this model runs, which already spends 24–32 GiB on lmcache L1),
-   not new kernel code. WSL2 will differ (virtio-blk raises miss cost further;
-   ram/cache matter more there).
+4. **Ship:** the Python host-tier cache as-is, opt-in, default off — enable
+   with `B12X_ROW_CACHE_BYTES=8.6MiB` (== `B12X_ROW_CACHE_ROWS=100000` at the
+   PLE geometry's 90 B/row; the byte knob rounds down to whole rows) and
+   `B12X_ROW_CACHE_TIER=host` — a stable +4 % on prefill-heavy profiles at
+   ~zero cost and zero VRAM. **For users wanting the full disk win on
+   SM120-class boxes, the answer is `ple_table_memory=ram`** (+14 %, 26.9 GiB
+   host RAM — affordable everywhere this model runs, which already spends
+   24–32 GiB on lmcache L1), not new kernel code. WSL2 will differ
+   (virtio-blk raises miss cost further; ram/cache matter more there).
+
+## 7. Full-sweep replication with the prefetch hook (2026-10-10/11)
+
+The §6 matrix ran one point per arm: c=1, context 0, 45 s decode + GSM8K. The
+verdict was re-measured as a full lil-bench sweep — `--concurrency 1,2,4,8,16`
+× `--contexts 0,16k,64k,128k`, 45 s/cell — on the same cloned production spec,
+**two rounds with reversed arm order** (round 2 `none,host,device,device-pf`,
+round 3 reversed), pooled per cell. Tree under test: this branch at
+`16c596af9` (SIEVE only; `B12X_ROW_CACHE_POLICY`/`B12X_PLE_PREFETCH` postdate
+it — the prefetch arm drove the same `prefetch()` API through the vLLM-side
+hook, gated by `VLLM_PLE_PREFETCH=1`). Harness `~/ab/run_sm120.sh` on server21,
+logs `~/ab/ple_ab_r{2,3}.log`.
+
+Pooled Δ vs the pooled no-cache baseline (gsm8k = pooled c=1 profile):
+
+| arm | decode c=1 | decode c≥2 | gsm8k tok/s | acceptance | hit rate |
+|---|---|---|---|---|---|
+| none (disk, no cache) | baseline | baseline | 195.6 | 3.10 | — |
+| host tier 100k | **+3.6 %** | **+3.4 %** | 198.7 | 3.08 | 0.638 |
+| device tier 100k (`auto` on discrete) | −7.9 % | +0.6 % | 191.6 | 3.09 | 0.649 |
+| device tier + prefetch | −2.9 % | −0.0 % | 190.2 | 3.09 | 0.650 |
+
+Revisions and additions to the §6 verdict:
+
+1. **Hit rate is traffic-dependent, and §6 under-measured it.** Under mixed
+   concurrency the pool reaches 0.64–0.65 (vs 0.44–0.46 at c=1-only), because
+   context-stable cells re-read the same rows. The working-set claim in §6
+   finding 2 stands (size is still not the lever); the ceiling value does not.
+2. **The decisive knob is the tier, not the pool.** On a discrete GPU, `auto`
+   selects the device tier and that costs −7.9 % at c=1; explicit `host` gains
+   +3.6 %/−3.4 % (§6's ≈ +4 % holds, now on the full surface).
+3. **The prefetch hook recovers +5.4 pp of the device-tier penalty** (−7.9 →
+   −2.9 at c=1): the disk miss wave is genuinely hideable under GPU compute.
+   It never beats `host`, so §6's rejection of extra machinery on the miss path
+   is unchanged — with prefetch the gap to baseline is within round noise, not
+   positive. Prefetch under vLLM needs **both** gates set: `VLLM_PLE_PREFETCH=1`
+   (runner hook) and `B12X_PLE_PREFETCH=1` (worker, added in `65138cc48`).
+4. **Protocol rule: single 45 s c=1 cells are below the noise floor for ≤5 %
+   effects.** The first c=1-only round of this series reported the host cache
+   as ~6 % *slower* than no cache — the sign inverted under the replicated
+   sweep. Any future row-cache verdict must be a sweep, ≥ 2 rounds, reversed
+   arm order.
+
+Not measured here: the `s3fifo` policy and the in-b12x `B12X_PLE_PREFETCH`
+worker path (both postdate the tree under test) — re-run the sweep matrix on
+the branch head before quoting policy or worker numbers.
 
 Not measured: WSL2 SM120 (end-user board); single boots for 5m/ram arms
 (ceiling direction is unambiguous, magnitude ±3 %).

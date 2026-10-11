@@ -31,6 +31,49 @@ _PREFETCH_SENTINEL = object()
 # contract, so nothing below the index is policy-aware.
 _ROW_CACHE_POLICIES = ("sieve", "s3fifo")
 
+# Suffixes accepted by ``B12X_ROW_CACHE_BYTES``, as multipliers of the decimal
+# amount. A bare number is plain bytes.
+_ROW_CACHE_SIZE_SUFFIXES = {
+    "": 1,
+    "K": 1 << 10,
+    "M": 1 << 20,
+    "G": 1 << 30,
+    "T": 1 << 40,
+}
+
+
+def _parse_row_cache_size(text: str, row_bytes: int) -> int:
+    """Return ``text`` (e.g. ``"8.6MiB"``, ``"1GiB"``, ``"900000"``) as a row count.
+
+    ``B12X_ROW_CACHE_BYTES`` lets an operator size the pool in the unit that
+    appears in the ``row_cache_bytes`` stat and the design docs, instead of
+    counting rows. A bare number is plain bytes; a decimal amount takes an
+    optional ``KiB``/``MiB``/``GiB``/``TiB`` suffix (the ``i`` and ``B`` are
+    optional, case-insensitive). The value rounds *down* to whole rows, so a
+    request below one row, and malformed, non-finite or negative input, are
+    construction errors rather than a silently disabled cache.
+    """
+    import re
+
+    match = re.fullmatch(
+        r"\s*(\d+(?:\.\d*)?)\s*(?:([KMGT])i?B?|B)?\s*", text, flags=re.IGNORECASE
+    )
+    if match is None:
+        raise ValueError(
+            "B12X_ROW_CACHE_BYTES must be a byte count, optionally with a "
+            "KiB/MiB/GiB/TiB suffix (e.g. '8.6MiB'), "
+            f"got {text!r}"
+        )
+    suffix = (match.group(2) or "").upper().rstrip("B").rstrip("I")
+    if suffix not in _ROW_CACHE_SIZE_SUFFIXES:
+        raise ValueError(f"B12X_ROW_CACHE_BYTES has an unknown multiplier in {text!r}")
+    size = float(match.group(1)) * _ROW_CACHE_SIZE_SUFFIXES[suffix]
+    if not math.isfinite(size) or size < row_bytes:
+        raise ValueError(
+            f"B12X_ROW_CACHE_BYTES={text!r} rounds to zero rows at {row_bytes} B/row"
+        )
+    return int(size) // row_bytes
+
 
 def _check_cuda(error: cudart.cudaError_t, operation: str) -> None:
     from cuda.bindings import runtime as cudart
@@ -158,10 +201,25 @@ class DiskRowCache:
     * ``cache_tier="device"`` keeps them in device memory, stages into a device
       buffer, and transfers only misses (discrete GPUs).
 
-    ``cache_rows``/``cache_tier``/``policy`` default to
-    ``B12X_ROW_CACHE_ROWS`` (0, off), ``B12X_ROW_CACHE_TIER`` (``auto``: host on
-    integrated GPUs, device otherwise) and ``B12X_ROW_CACHE_POLICY``
-    (``sieve``). The GDS backend stages on the device itself and is not cached.
+    Configuration (read at construction; the ``cache_*`` arguments win over
+    their environment defaults):
+
+    * ``B12X_ROW_CACHE_ROWS`` — pool capacity in rows (default ``0``, off).
+    * ``B12X_ROW_CACHE_BYTES`` — the same knob in pool bytes, rounded down to
+      whole rows: ``8.6MiB`` == 100000 rows at 90 B/row. Mutually exclusive
+      with ``B12X_ROW_CACHE_ROWS``.
+    * ``B12X_ROW_CACHE_TIER`` — ``auto`` (host on integrated GPUs, device on
+      discrete), ``host`` or ``device``. On a discrete GPU the ``auto`` default
+      selects ``device``, which measured *slower* than no cache at c=1; the
+      SM120 result supports explicit ``host`` there.
+    * ``B12X_ROW_CACHE_POLICY`` — ``sieve`` (default) or ``s3fifo``; S3-FIFO
+      leads at 100k rows on the production row-id trace (libCacheSim replay,
+      see ``formal/DESIGN.md``).
+    * ``B12X_PLE_PREFETCH`` — nonzero turns the ``prefetch`` worker on. Under
+      vLLM the runner hook is gated separately by ``VLLM_PLE_PREFETCH``; both
+      must be set.
+
+    The GDS backend stages on the device itself and is not cached.
 
     ``prefetch(ids)`` warms the cache ahead of the read path from a background
     worker, driven by ``B12X_PLE_PREFETCH`` (off by default). Reserved rows sit
@@ -216,7 +274,22 @@ class DiskRowCache:
         if self._backend not in ("io_uring", "gds", "host"):
             raise ValueError("B12X_DISK_BACKEND must be io_uring or gds")
         if cache_rows is None:
-            cache_rows = int(os.environ.get("B12X_ROW_CACHE_ROWS", "0"))
+            # ``B12X_ROW_CACHE_BYTES`` is the same knob in pool bytes (the unit
+            # ``stats()['row_cache_bytes']`` reports), because an operator
+            # reasons about a host-RAM budget in MiB, not in rows of 90 B. It
+            # is only consulted when the row count itself comes from the
+            # environment; an explicit ``cache_rows`` argument beats both.
+            row_bytes = self.weight_row_bytes + self.scale_row_bytes
+            size_env = os.environ.get("B12X_ROW_CACHE_BYTES")
+            rows_env = os.environ.get("B12X_ROW_CACHE_ROWS")
+            if size_env is not None and rows_env is not None:
+                raise ValueError(
+                    "set only one of B12X_ROW_CACHE_ROWS / B12X_ROW_CACHE_BYTES"
+                )
+            if size_env is not None:
+                cache_rows = _parse_row_cache_size(size_env, row_bytes)
+            else:
+                cache_rows = int(rows_env or "0")
         cache_rows = operator.index(cache_rows)
         if cache_rows < 0:
             raise ValueError("cache_rows must be nonnegative")
