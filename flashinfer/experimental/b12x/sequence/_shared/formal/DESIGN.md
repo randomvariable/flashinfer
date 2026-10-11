@@ -151,7 +151,7 @@ Findings:
    overlapped and only ~0.5-1 % exposed, so the C plan's CPU term is the
    right one and the prize is the exposed fraction, not the 17 ms estimate;
    (b) GB10's ARM cores have never been profiled for `_read_cached`
-   -- the 181 ns/id constant is x86-measured, plausibly 1.5-2.5x worse there,
+   -- the 181 ns/id constant is measured on server21's Neoverse-N1 host (at ~1.17 GHz, 39% of its 3 GHz ceiling), NOT x86; GB10's cores are newer but fewer-per-process budget,
    while the bounce term is ~0 on a unified board. Both numbers must be taken
    before quoting a cross-board C verdict. The device tier additionally pays
    GPU `index_select`/`index_copy` work per step that zeroes its own miss
@@ -262,3 +262,31 @@ Readings:
    prefill is a separate regime and is NOT covered here (its disk time is
    NVMe, already ruled non-bookkeeping in §6); GB10's ARM per-id Python
    constant remains unmeasured — the §6(b) half of the gate.
+
+**Trigger analysis (theoretical, from the §8 constants; not measured).** The
+gate is a race between the GPU chunk cycle and the host's per-call Python
+(32.1 ms at 96 304 ids). Break-even is a 1.26x faster GPU **on this host**:
+
+| board | GPU cycle (ms) | host Python (ms) | exposed | C-port prize |
+|---|---|---|---|---|
+| Max-Q 300 W (server21, measured) | 40.6 | 32.1 | 0 % | 0 % |
+| Workstation 600 W / Server 400-600 W¹ | 32.5-38.7 | 32.1 | 0-0.5 % | ≈ nothing — same die, clocks-only ≈ 1.05-1.25x² |
+| VR200 + 88-core Vera host (40 ns/id³) | 8.1-14.5 | 12.3 | 0 % (HBM4-capped 2.8x) / 51 % (5x) | up to ~10 % of wall |
+| VR200 + old N1-class host | 8.1-14.5 | 32.1 | 121-295 % | the host *is* the bottleneck |
+
+¹ NVIDIA lists 600 W Workstation / 400-600 W Server editions vs the 300 W
+   Max-Q in server21's `nvidia-smi`; same GB100 die + 96 GB GDDR7.
+² GDDR7 spec is unchanged across SKUs, so a memory-bound prefill phase gains
+   little from TDP; only the compute-bound part scales.
+³ 4.5x better than the Neoverse-N1 constant, justified by modern OoO cores;
+   server21's own constant would drop ~2.5x just by holding its 3 GHz ceiling
+   (`CPU max MHz: 3000`, observed scaling 39 %) — the Python term is
+   host-throttled here, and a cheap re-check on a pinned-clock host is due
+   before trusting the 1.26x break-even.
+
+Honest ceiling of this table: every cell scales the §8 cycle by announced
+FLOPS/bandwidth ratios (VR200: 50 PFLOPS NVFP4, 22 TB/s HBM4) — theoretical,
+no board in the last two rows has run this stack. The *decision* it supports:
+on the 600 W part, do not build the C port; on Vera-class hardware the per-id
+host constant, not the GPU, sets whether prefill is host-bound, and that
+number must be measured on the actual host before the gate can flip.
