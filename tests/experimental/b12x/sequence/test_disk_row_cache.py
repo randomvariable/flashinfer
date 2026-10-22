@@ -782,3 +782,129 @@ def test_rejected_prefetch_sync_identical(monkeypatch):
                 )
     finally:
         cache.close()
+
+
+def _cpu_row_cache():
+    """Exercise host orchestration and the real C index without CUDA allocation."""
+    import queue
+    from b12x.sequence._shared.row_cache import S3FifoRowCache
+
+    cache = DiskRowCache.__new__(DiskRowCache)
+    cache._closed = True  # This harness owns no CUDA resources to close.
+    cache._row_cache_failed = False
+    cache.max_lookups = 2
+    cache.cache_rows = 8
+    cache.shard_start, cache.shard_end = 0, 8
+    cache.weight_row_bytes, cache.scale_row_bytes = 3, 0
+    cache._backend = "host"
+    cache._host_weight = np.arange(24, dtype=np.uint8).reshape(8, 3)
+    cache._host_scale = None
+    cache._lock = threading.RLock()
+    cache._prefetch_stop = False
+    cache._prefetch_queue = queue.Queue(maxsize=64)
+    cache._ids_buffer = np.zeros(2, dtype=np.int64)
+    cache._miss_ids_view = np.zeros(2, dtype=np.int64)
+    cache._miss_weight_view = np.zeros((2, 3), dtype=np.uint8)
+    cache._miss_scale_view = None
+    cache._stage_host = [np.zeros((2, 3), dtype=np.uint8)]
+    cache._pool = [np.full((8, 3), 255, dtype=np.uint8)]
+    cache._index = S3FifoRowCache(
+        8,
+        2,
+        cache._ids_buffer,
+        cache._miss_ids_view,
+        [cache._miss_weight_view],
+        cache._stage_host,
+        cache._pool,
+    )
+    return cache
+
+
+def test_failed_miss_never_serves_admitted_bytes(monkeypatch):
+    cache = _cpu_row_cache()
+    cache._ids_buffer[:] = [1, 2]
+
+    def fail_fetch(*args):
+        raise OSError("injected source failure")
+
+    monkeypatch.setattr(cache, "_fetch", fail_fetch)
+    try:
+        with pytest.raises(OSError, match="injected source failure"):
+            cache._read_cached(2)
+        assert cache._index.is_ready(1)  # Admission already happened in C.
+        monkeypatch.setattr(cache, "_fetch", DiskRowCache._fetch.__get__(cache))
+        for read in (cache._read_cached, cache._read_staged):
+            with pytest.raises(RuntimeError, match="unusable"):
+                read(2)
+        np.testing.assert_array_equal(cache._pool[0], np.full((8, 3), 255))
+    finally:
+        cache._index.close()
+
+
+def test_prefetch_large_request_fetches_bounded_batches(monkeypatch):
+    cache = _cpu_row_cache()
+    monkeypatch.setattr(cache, "_prefetch_ok", lambda: True)
+    monkeypatch.setattr(cache, "_ensure_prefetch_worker", lambda: None)
+    fetch = cache._fetch
+    counts = []
+
+    def bounded_fetch(ids, weights, scales, count):
+        assert count <= cache.max_lookups
+        counts.append(count)
+        fetch(ids, weights, scales, count)
+
+    monkeypatch.setattr(cache, "_fetch", bounded_fetch)
+    try:
+        assert cache.prefetch([0, 1, 2, 3, 4, 4, -1, 8])
+        # Run queued jobs synchronously while retaining the normal worker path.
+        cache._closed = False
+        while not cache._prefetch_queue.empty():
+            cache._run_prefetch_job(cache._prefetch_queue.get_nowait())
+        assert counts == [2, 2, 1]
+        for key in range(5):
+            slot = cache._index.get(key)
+            assert slot is not None
+            np.testing.assert_array_equal(cache._pool[0][slot], cache._host_weight[key])
+    finally:
+        cache._closed = True
+        cache._index.close()
+
+
+def test_prefetch_chunking_property():
+    from hypothesis import given, settings, strategies as st
+    import queue
+
+    @settings(max_examples=100, deadline=None, derandomize=True)
+    @given(
+        st.lists(st.integers(min_value=-4, max_value=12), max_size=80),
+        st.integers(min_value=1, max_value=4),
+    )
+    def check(ids, queue_capacity):
+        cache = _cpu_row_cache()
+        cache._prefetch_queue = queue.Queue(maxsize=queue_capacity)
+        cache._prefetch_ok = lambda: True
+        cache._ensure_prefetch_worker = lambda: None
+        expected = list(dict.fromkeys(key for key in ids if 0 <= key < 8))
+        expected = expected[: queue_capacity * cache.max_lookups]
+        try:
+            assert cache.prefetch(ids)
+            cache._closed = False
+            admitted = []
+            while not cache._prefetch_queue.empty():
+                job = cache._prefetch_queue.get_nowait()
+                assert 0 < len(job) <= cache.max_lookups
+                admitted.extend(job)
+                cache._run_prefetch_job(job)
+            assert admitted == expected
+            for key in expected:
+                slot = cache._index.get(key)
+                assert slot is not None
+                np.testing.assert_array_equal(
+                    cache._pool[0][slot], cache._host_weight[key]
+                )
+            assert cache._index.stats()["resident"] == len(expected)
+        finally:
+            cache._closed = True
+            cache._index.close()
+
+    check()

@@ -114,6 +114,15 @@ typedef struct {
   uint32_t pad;
 } rc_store_probe_t;
 
+// The three record types are exactly one cache line each (four records per
+// line in the open-addressed maps). The accounting oracle in
+// tests/experimental/b12x/sequence/test_row_cache_policies.py pins those sizes
+// in Python, so a layout change has to be a deliberate one: it fails here at
+// build time rather than as an unexplained stats mismatch later.
+typedef char require_rc_entry_bytes[(sizeof(rc_entry_t) == 16) ? 1 : -1];
+typedef char require_rc_dedup_bytes[(sizeof(rc_dedup_t) == 16) ? 1 : -1];
+typedef char require_rc_store_probe_bytes[(sizeof(rc_store_probe_t) == 16) ? 1 : -1];
+
 #define RC_TAG_PRESENT 0x80u  // position stays part of a probe run
 #define RC_TAG_TOMB 0xC0u     // tombstone: probes continue, inserts may reuse
 #define RC_TAG_H2 0x3Fu       // h2 fingerprint bits
@@ -212,6 +221,12 @@ typedef struct {
   int dedup_pf;
   int64_t probe_mask;
   int64_t hits, misses;
+  // Logical bytes of every RC_ALLOC block, accumulated by the create path as
+  // each allocation succeeds. This is the arrays term of the metadata_bytes
+  // py_row_cache_stats reports, which adds sizeof(row_cache_t) for the header
+  // itself; counting at the allocation site is what keeps the footprint from
+  // drifting when an array is added, retyped, or resized.
+  int64_t alloc_bytes;
 } row_cache_t;
 
 static uint64_t rc_mix64(uint64_t x) {
@@ -920,13 +935,20 @@ static PyObject* py_row_cache_create(PyObject* self, PyObject* args) {
     if (ok) rc->row_bytes[p] = (size_t)rc->pool[p].shape[1];
   }
 
-#define RC_ALLOC(type, field, count, zero)               \
-  if (ok) {                                              \
-    rc->field = rc_block((count), sizeof(type), (zero)); \
-    if (!rc->field) {                                    \
-      PyErr_NoMemory();                                  \
-      ok = false;                                        \
-    }                                                    \
+// One allocation site, one accounting site: each block's logical payload
+// (count * sizeof(type), not the allocator's minimum-size request and not the
+// 2 MiB a huge-page block is rounded up to) is folded into rc->alloc_bytes the
+// moment the allocation succeeds, so the reported footprint can neither forget
+// an array the create path allocates nor list one it does not.
+#define RC_ALLOC(type, field, count, zero)                         \
+  if (ok) {                                                        \
+    rc->field = rc_block((count), sizeof(type), (zero));           \
+    if (!rc->field) {                                              \
+      PyErr_NoMemory();                                            \
+      ok = false;                                                  \
+    } else {                                                       \
+      rc->alloc_bytes += (int64_t)(count) * (int64_t)sizeof(type); \
+    }                                                              \
   }
   RC_ALLOC(rc_entry_t, table, table_size, true)
   RC_ALLOC(uint32_t, slotrec, capacity, false)
@@ -1489,15 +1511,22 @@ static PyObject* py_row_cache_raw_dump(PyObject* self, PyObject* capsule) {
 
 // Hit/miss counters and queue sizes for DiskRowCache.stats; the s/m/g fields
 // keep the probe surface the Python class exposed through privates.
+// metadata_bytes is the host footprint the index owns outright: the header plus
+// every RC_ALLOC block -- the resident and ghost lookup tables, the rings and
+// back-maps, and the per-batch arrays sized max_lookups and probes. The bound
+// id buffers and row planes are the caller's memory and are accounted by
+// DiskRowCache, so they stay out of this number.
 static PyObject* py_row_cache_stats(PyObject* self, PyObject* capsule) {
   (void)self;
   row_cache_t* rc = rc_from(capsule);
   if (!rc) return NULL;
-  return Py_BuildValue("{s:L,s:L,s:L,s:l,s:l,s:l,s:L,s:L,s:L,s:L}",  //
+  unsigned long long metadata = sizeof(row_cache_t) + (unsigned long long)rc->alloc_bytes;
+  return Py_BuildValue("{s:L,s:L,s:L,s:l,s:l,s:l,s:L,s:L,s:L,s:L,s:K}",  //
                        "hits", rc->hits, "misses", rc->misses, "resident",
                        rc->ready_count + rc->loading_count, "s", rc->small_count, "m",
                        rc->main_count, "g", rc->ghost_count, "capacity", rc->capacity, "small_cap",
-                       rc->small_cap, "main_cap", rc->main_cap, "ghost_cap", rc->ghost_cap);
+                       rc->small_cap, "main_cap", rc->main_cap, "ghost_cap", rc->ghost_cap,
+                       "metadata_bytes", metadata);
 }
 
 static PyMethodDef methods[] = {
@@ -1525,7 +1554,12 @@ static PyModuleDef module = {
 
 PyMODINIT_FUNC PyInit__b12x_row_cache(void) {
   PyObject* result = PyModule_Create(&module);
-  if (result && PyModule_AddIntConstant(result, "ABI_VERSION", 1) < 0) {
+  if (!result) return NULL;
+  // The header term of stats' metadata_bytes, published so the accounting
+  // oracle in tests/experimental/b12x/sequence/test_row_cache_policies.py can
+  // check the total exactly instead of against a guessed struct size.
+  if (PyModule_AddIntConstant(result, "ABI_VERSION", 1) < 0 ||
+      PyModule_AddIntConstant(result, "ROW_CACHE_HEADER_BYTES", (long)sizeof(row_cache_t)) < 0) {
     Py_DECREF(result);
     return NULL;
   }

@@ -25,6 +25,8 @@ import random
 
 import numpy as np
 import pytest
+from hypothesis import example, given, settings
+from hypothesis.strategies import integers, none, one_of, sampled_from
 
 from b12x.sequence._shared.row_cache import RowPlan
 
@@ -580,6 +582,110 @@ class _Pair:
 
 
 # ---------------------------------------------------------------------------
+# native accounting oracle: stats["metadata_bytes"]
+#
+# The index owns two kinds of host memory outright: the row_cache_t header and
+# every block the create path hands out through RC_ALLOC -- the resident and
+# ghost lookup tables, the rings and back-maps, and the per-batch arrays sized
+# max_lookups and probes. The C side accumulates each block's logical size at
+# the allocation site, so this list is the independent oracle: field-for-field
+# with the RC_ALLOC lines in _row_cache.c, it fails when an array is added,
+# retyped or resized there without a term, and it fails when the reported
+# number drops a term -- as it did while the header and the batch arrays were
+# left out.
+# ---------------------------------------------------------------------------
+
+_RECORD_BYTES = 16  # rc_entry_t / rc_dedup_t / rc_store_probe_t (static-asserted in C)
+_U32_BYTES = 4  # uint32_t slotrec/ghostrec, int32_t rings, back-maps and stacks
+_LATCH_BYTES = 1  # uint8_t ghost_latch
+# The RC_ALLOC blocks sized by the batch, not the cache: dropping these is the
+# accounting bug this section guards, so they are called out by name.
+_BATCH_ARRAYS = (
+    "hit_pos",
+    "hit_slot",
+    "miss_pos",
+    "miss_row",
+    "store_slot",
+    "store_row",
+    "ghost_latch",
+    "dedup",
+    "store_probe",
+)
+# One term per RC_ALLOC line in _row_cache.c; a mismatch in count means the
+# oracle list and the allocation list have drifted apart.
+_RC_ALLOC_ARRAYS = 19
+
+
+def _pow2_ceil(value: int) -> int:
+    """Mirror of rc_pow2_ceil: the smallest power of two >= value."""
+    n = 1
+    while n < value:
+        n <<= 1
+    return n
+
+
+def _rc_alloc_terms(capacity: int, max_lookups: int) -> dict[str, int]:
+    """Logical bytes of each RC_ALLOC block, keyed by the C field name."""
+    table_size = _pow2_ceil(max(capacity * 2, 4))
+    # ghost_cap is 90% of capacity; the entry universe is ghost_cap + 2 because
+    # _demote_ghost inserts before trimming (the dict holds cap+1 keys).
+    ghost_entries = capacity * 90 // 100 + 2
+    ghost_table_size = _pow2_ceil(max(ghost_entries * 2, 4))
+    probes = _pow2_ceil(max(max_lookups * 2, 8))
+    return {
+        "table": _RECORD_BYTES * table_size,
+        "slotrec": _U32_BYTES * capacity,
+        "small_ring": _U32_BYTES * capacity,
+        "main_ring": _U32_BYTES * capacity,
+        "free_stack": _U32_BYTES * capacity,
+        "ghost_table": _RECORD_BYTES * ghost_table_size,
+        "ghostrec": _U32_BYTES * ghost_entries,
+        "ghost_prev": _U32_BYTES * ghost_entries,
+        "ghost_next": _U32_BYTES * ghost_entries,
+        "ghost_free_stack": _U32_BYTES * ghost_entries,
+        "hit_pos": _U32_BYTES * max_lookups,
+        "hit_slot": _U32_BYTES * max_lookups,
+        "miss_pos": _U32_BYTES * max_lookups,
+        "miss_row": _U32_BYTES * max_lookups,
+        "store_slot": _U32_BYTES * max_lookups,
+        "store_row": _U32_BYTES * max_lookups,
+        "ghost_latch": _LATCH_BYTES * max_lookups,
+        "dedup": _RECORD_BYTES * probes,
+        "store_probe": _RECORD_BYTES * probes,
+    }
+
+
+def _expected_metadata_bytes(native, capacity: int, max_lookups: int) -> int:
+    """The whole footprint the native stats must report for this geometry."""
+    return native.ROW_CACHE_HEADER_BYTES + sum(
+        _rc_alloc_terms(capacity, max_lookups).values()
+    )
+
+
+def _metadata_of(native, capacity: int, max_lookups: int, widths=(4, 2)):
+    """(metadata_bytes, capsule) of a fresh index over caller-owned buffers.
+
+    The capsule comes back so a caller can keep the index alive (the number must
+    be re-readable, and stable, after other indexes are created and freed).
+    """
+
+    def plane(count, width):
+        # Caller-owned memory: none of this belongs in the index's number.
+        return np.zeros((count, width), np.uint8)
+
+    capsule = native.row_cache_create(
+        capacity,
+        max_lookups,
+        memoryview(np.zeros(max_lookups, np.int64)),
+        memoryview(np.zeros(max_lookups, np.int64)),
+        tuple(memoryview(plane(max_lookups, width)) for width in widths),
+        tuple(memoryview(plane(max_lookups, width)) for width in widths),
+        tuple(memoryview(plane(capacity, width)) for width in widths),
+    )
+    return native.row_cache_stats(capsule)["metadata_bytes"], capsule
+
+
+# ---------------------------------------------------------------------------
 # the build itself
 # ---------------------------------------------------------------------------
 
@@ -844,11 +950,188 @@ def test_lcs_all_prefix_matches_reference():
 def test_stats_surface():
     pair = _pair(16)
     pair.serve([1, 2, 3, 1])  # the repeated 1 is a deduped miss, not a hit
-    st = pair.native.row_cache_stats(pair.rc)
-    assert set(st) >= {"hits", "misses", "resident", "s", "m", "g"}
-    assert st["hits"] == 0 and st["misses"] == 4
+    stats = pair.native.row_cache_stats(pair.rc)
+    assert set(stats) >= {
+        "hits",
+        "misses",
+        "resident",
+        "s",
+        "m",
+        "g",
+        "capacity",
+        "small_cap",
+        "main_cap",
+        "ghost_cap",
+        "metadata_bytes",
+    }
+    assert stats["hits"] == 0 and stats["misses"] == 4
+    # The footprint is part of the surface DiskRowCache budgets against, and a
+    # deduped miss that moved no bytes must not have moved it either.
+    assert stats["metadata_bytes"] == _expected_metadata_bytes(
+        pair.native, pair.capacity, pair.max_lookups
+    )
     pair.serve([1])  # now resident: one hit, no stores
     assert pair.native.row_cache_stats(pair.rc)["hits"] == 1
+
+
+def test_metadata_bytes_covers_header_and_every_allocated_array():
+    """The bug: stats carried counters only, so the reported footprint missed
+    the row_cache_t header and all nine RC_ALLOC arrays sized by the batch."""
+    native = _c_module()
+    capacity, max_lookups = 16, 40
+    terms = _rc_alloc_terms(capacity, max_lookups)
+    assert len(terms) == _RC_ALLOC_ARRAYS  # in step with the RC_ALLOC list
+    assert all(value > 0 for value in terms.values())  # every term is load-bearing
+    metadata, capsule = _metadata_of(native, capacity, max_lookups)
+    assert native.row_cache_stats(capsule)["metadata_bytes"] == metadata
+    assert metadata == _expected_metadata_bytes(native, capacity, max_lookups)
+    # A number that dropped the header, or the batch arrays, is not this one:
+    # the tables plus rings alone are strictly smaller, and the header is a
+    # term the module publishes precisely so this comparison is exact.
+    tables_only = sum(
+        value for name, value in terms.items() if name not in _BATCH_ARRAYS
+    )
+    assert native.ROW_CACHE_HEADER_BYTES > 0
+    assert metadata > tables_only + native.ROW_CACHE_HEADER_BYTES
+
+
+def test_metadata_bytes_grows_with_the_batch_arrays():
+    """Differential check at one capacity: widening the batch must move the
+    number by exactly what its arrays grow (six int32 planes, one uint8 latch,
+    and the two stamped tables crossing into their next power of two)."""
+    native = _c_module()
+    narrow, wide = 4, 8  # probes: 8 -> 16, so both buckets are represented
+    narrow_bytes = _metadata_of(native, 8, narrow)[0]
+    wide_bytes = _metadata_of(native, 8, wide)[0]
+    assert wide_bytes > narrow_bytes  # the batch arrays are counted at all
+    assert wide_bytes - narrow_bytes == sum(_rc_alloc_terms(8, wide).values()) - sum(
+        _rc_alloc_terms(8, narrow).values()
+    )
+    assert (narrow_bytes, wide_bytes) == (
+        _expected_metadata_bytes(native, 8, narrow),
+        _expected_metadata_bytes(native, 8, wide),
+    )
+
+
+_POW2_EDGES = sorted(
+    {
+        value
+        for exponent in range(13)
+        for value in ((1 << exponent) - 1, 1 << exponent, (1 << exponent) + 1)
+        if value >= 1
+    }
+)
+
+
+@settings(deadline=None, max_examples=150)
+@example(capacity=1, max_lookups=1)
+@example(capacity=2, max_lookups=3)
+@example(capacity=1023, max_lookups=1023)
+@example(capacity=1024, max_lookups=1024)
+@example(capacity=1025, max_lookups=1025)
+@example(capacity=2047, max_lookups=4095)
+@given(
+    capacity=one_of(sampled_from(_POW2_EDGES), integers(1, 4096)),
+    max_lookups=one_of(sampled_from(_POW2_EDGES), integers(1, 1024)),
+)
+def test_metadata_bytes_formula_holds_across_pow2_boundaries(capacity, max_lookups):
+    """The stamped tables and the two lookup tables are sized through
+    rc_pow2_ceil, the ghost universe is the 90% share plus the two entries
+    insert-before-trim needs, and only the four capacity arrays and the four
+    ghost-entry arrays are linear, so the accounting has to be exact at every
+    power-of-two and ghost-share discontinuity, not just at the round geometry
+    the fixed regression drives."""
+    native = _c_module()
+    assert _metadata_of(native, capacity, max_lookups)[0] == _expected_metadata_bytes(
+        native, capacity, max_lookups
+    )
+
+
+@settings(deadline=None, max_examples=60)
+@given(
+    capacity=integers(1, 512),
+    max_lookups=integers(1, 128),
+    weight=integers(1, 64),
+    extra=one_of(none(), integers(1, 33)),
+)
+def test_metadata_bytes_ignores_the_callers_row_planes(
+    capacity, max_lookups, weight, extra
+):
+    """The id buffers and the row planes are bound, not owned: neither their
+    count nor their width may move the index's own footprint, in either
+    direction, over any geometry."""
+    native = _c_module()
+    bound = (weight,) if extra is None else (weight, extra)
+    numbers = {
+        _metadata_of(native, capacity, max_lookups, plane)[0]
+        for plane in (bound, (weight,), (weight, weight), (1,))
+    }
+    assert numbers == {_expected_metadata_bytes(native, capacity, max_lookups)}
+
+
+def test_metadata_bytes_is_per_instance_and_stable_under_load():
+    """One creation-time sum, no running total: a second live index must not
+    move the first's number, freeing it must not move it either, and a serving
+    workload that fills, evicts, ghosts, reserves and cancels must leave the
+    accounting exactly where create put it."""
+    native = _c_module()
+    capacity, max_lookups = 64, 40
+    expected = _expected_metadata_bytes(native, capacity, max_lookups)
+    first, first_capsule = _metadata_of(native, capacity, max_lookups)
+    assert first == expected
+    other, other_capsule = _metadata_of(native, 32, 8)
+    assert other == _expected_metadata_bytes(native, 32, 8)
+    assert native.row_cache_stats(first_capsule)["metadata_bytes"] == expected
+    del other_capsule
+    assert native.row_cache_stats(first_capsule)["metadata_bytes"] == expected
+
+    pair = _pair(capacity, max_lookups=max_lookups, weight=8, scale=3)
+    assert pair.native.row_cache_stats(pair.rc)["metadata_bytes"] == expected
+    rng = random.Random(20261022)
+    stream = [rng.randrange(8 * capacity) for _ in range(4000)]
+    for index in range(0, len(stream), max_lookups):
+        pair.serve(stream[index : index + max_lookups])
+        if index % (7 * max_lookups) == 3 * max_lookups:
+            key = 100_000 + index
+            _, slot = pair.reserve(key)
+            if slot is not None:
+                if index % (3 * max_lookups) == 0:
+                    pair.cancel(slot)
+                else:
+                    pair.confirm(key, slot)
+    stats = pair.native.row_cache_stats(pair.rc)
+    assert stats["metadata_bytes"] == expected
+    # The workload really churned the structure it is charged for.
+    assert stats["misses"] > capacity and stats["g"] > 0
+    assert 0 < stats["resident"] <= capacity
+
+
+# rc_block serves a block of one huge page (2 MiB) or more from posix_memalign +
+# MADV_HUGEPAGE and everything smaller from malloc/calloc, and the first blocks
+# to cross that line are the resident table (16 B records over a pow2 >= 2 times
+# capacity, so at capacity 32769) and the two stamped dedup tables (at
+# max_lookups 32769). Both allocator paths are therefore probed either side of
+# the boundary, plus a geometry where several blocks are huge at once.
+@pytest.mark.parametrize(
+    ("capacity", "max_lookups"),
+    (
+        (32767, 1),
+        (32768, 1),
+        (32769, 1),
+        (16, 32768),
+        (16, 32769),
+        (65536, 1),
+    ),
+)
+def test_metadata_bytes_counts_logical_bytes_on_the_huge_page_path(
+    capacity, max_lookups
+):
+    """Neither the allocator's minimum-size request nor the huge page a block is
+    aligned into: metadata_bytes is the arrays' logical size on both paths."""
+    native = _c_module()
+    assert _metadata_of(native, capacity, max_lookups, (1,))[0] == (
+        _expected_metadata_bytes(native, capacity, max_lookups)
+    )
 
 
 # ---------------------------------------------------------------------------
