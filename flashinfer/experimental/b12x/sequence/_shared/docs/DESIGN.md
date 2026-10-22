@@ -23,8 +23,14 @@ A PLE (n-gram embedding) table is **320,001,536 rows × (80 B packed-NVFP4 weigh
 10 B E4M3 group-64 scale) = 26.9 GiB**, in 128 shard files of 2,500,012 rows each
 (`split_ngram_parts: 128`; measured from the CSF QAD checkpoint headers), far too
 large for VRAM. `DiskRowCache` reads the rows a step needs over io_uring
-(O_DIRECT, fixed buffers/files, 4 KiB block coalescing) into a batch-sized
-mapped-host staging buffer; a Triton decode kernel then gathers rows from it.
+(O_DIRECT, fixed buffers/files) into a batch-sized mapped-host staging buffer; a
+Triton decode kernel then gathers rows from it. The reader sizes each row's
+fragment floor per file from `statx`'s `STATX_DIO_READ_ALIGN`/`STATX_DIOALIGN`
+(`ple_dio_gran`; floor `PLE_GRAN_MIN` 512 B, default `PLE_BLOCK` 4 KiB when statx
+cannot answer) instead of a fixed 4 KiB split, coalesces contiguous aligned blocks
+into one `READ_FIXED` up to `PLE_READ_MAX` (64 KiB), and runs a density-gated
+fragment sort; the GDS/cuFile planner leaves that pick flag clear and keeps the
+historical fixed 4 KiB fragments.
 Every step re-reads its rows — the cache stages exactly one batch and retains
 nothing. Access is Zipfian: measured over 3.03 M row reads (1.05 M distinct)
 from a real `llm-inference-bench` run, 65 % of reads are repeats, the top 1 %
@@ -85,9 +91,25 @@ zero-copy prize justifies the deferred-reclamation risk in §3.
 
 What the shipped C port does implement: hit/miss resolution and replacement
 policy as the separate extension `_row_cache.c` (`S3FifoRowCache`) — the
-open-addressed map, queues, and miss-id list. The io_uring reader
-(`_ple_reader.c`, `ple_reader_run`) and its submit path are unchanged; the miss
-wave still stages through the bounce buffer.
+open-addressed map, queues, and miss-id list — see §3 for the hit-copy/store
+ordering. The io_uring reader (`_ple_reader.c`) is driven by `py_ple_reader_run`,
+whose core loop `ple_uring_run` submits and reaps in *waves*: `ple_prepare_wave`
+arms up to `slots_count` `READ_FIXED` SQEs off the free-slot list and `ple_flush`
+issues one `io_uring_submit_and_wait` that blocks until half the ring
+(`slots_count / 2`, ≥ 1) has completed — replacing the old wait-one-CQE
+granularity that left only ~11 requests in flight at 64 slots — after which
+`ple_scatter` reaps each CQE, scatters its bytes into the weight/scale planes,
+and returns the slot. The miss wave still stages through the bounce buffer.
+
+The queue depth is a **floor plus a halving retry**, not a fixed size: the reader
+raises a caller's `queue_depth` to `PLE_DEFAULT_DEPTH` (256), honouring larger
+explicit requests, then halves the slot count on `io_uring_register_buffers`
+refusal — registered buffers are pinned and charged against the per-process
+`RLIMIT_MEMLOCK` shared with every other ring (`ple_slot_budget` is only an
+estimate to skip a doomed first attempt). It halves down to `PLE_MIN_SLOTS` (2,
+the minimum that overlaps a submit with a completion) and only then fails the
+reader; `stats()` reports the depth that actually landed (`depth_effective`)
+against `depth_requested`.
 
 ### Placements (the shipped host tier)
 
@@ -101,6 +123,39 @@ through mapped, page-locked host memory and the persistent pool lives in host
 RAM. The `host_rows` source (a shard already resident as CPU tensors) shares
 this layout.
 
+### Reader stats, failure terminality, and `max_lookups` chunking
+
+**Reader metadata is accounted separately from the pool.** `DiskRowCache.stats()`
+merges two independent surfaces: the io_uring reader's `py_ple_reader_stats`
+reports the plan/queue bookkeeping — `metadata_bytes` (reader struct, fragment and
+job arrays, slot/iovec/free-slot tables, the registered-fd array, and the SQ/CQ
+ring bytes), `staging_bytes` (`slots_count × PLE_READ_MAX`), the coalescing
+counters (`unique_blocks`, `coalesced_reads`, `submit_calls`), the bytes read, and
+the silent-fallback knobs (`depth_effective`/`depth_requested`, `dio_align`,
+`uring_flags`) — while the **pool** is charged only from the C index:
+`row_cache_bytes = cache_rows × (weight_row_bytes + scale_row_bytes)` with
+`row_cache_resident`/`_hits`/`_misses`/`_small`/`_main`/`_ghost` from
+`S3FifoRowCache.stats()`. The native index reports its struct and all array
+allocations as `row_cache_metadata_bytes`; these bytes also contribute to
+`metadata_bytes` and `owned_host_bytes`, separately from the pool.
+
+**The reader and the cache are failure-terminal.** A submit or completion error
+poisons the ring once: `ple_uring_run` sets `reader->poisoned`, drains and exits
+the ring, and every later `py_ple_reader_run` refuses with "unusable after a
+submission/completion failure; create a new reader". On the host tier a failed
+synchronous miss fetch or store sets `_row_cache_failed` and stops the speculative
+prefetch worker. Both `_read_staged` and `_read_cached` then raise. `prefetch`
+rejects new requests, and the worker cancels in-flight reservations instead of
+publishing them. The index is **retained until `close()`** — an in-flight worker or
+reader may still own it — so the cache is *unusable until close/recreation*, not
+freed immediately; recreate the `DiskRowCache` to recover.
+
+**Batches and prefetch waves are capped at `max_lookups`.** The C reader and the
+pinned miss/staging planes are sized for `max_lookups` rows; `py_ple_reader_run`
+rejects `count > max_lookups` and `read_rows` rejects out-of-capacity counts.
+`prefetch` splits distinct in-shard IDs into jobs of at most `max_lookups` before
+enqueueing them. Enqueueing remains nonblocking and stops when the queue is full.
+
 ## 3. The one dangerous invariant — and its proof
 
 Everything is bookkeeping except reclamation of shared bytes: **data an
@@ -111,17 +166,18 @@ in-use slots — it has no such check.
 
 - **Pool plane — an in-flight fetch (`LOADING`) is never a victim (structural).**
   `rc_reserve` claims a `FREE` slot and sets `LOADING`; the slot joins no ring.
-  The eviction pops (`rc_pop_small`, `rc_pop_main`) walk only the `SMALL`/`MAIN`
-  rings of `READY` slots, so *"no pop can reach"* a `LOADING` slot
-  (`_row_cache.c:30-31`); and `claim_for_loading` only takes `FREE`/fresh slots,
-  so it is never re-handed to a second fetch until `rc_confirm`/`rc_cancel` ends
-  the fetch. This follows from the state machine, not an eviction-time test.
+  The eviction pops `rc_pop_small` / `rc_pop_main` walk only the `SMALL`/`MAIN`
+  rings of `READY` slots, so *"no pop can reach"* a `LOADING` slot; and
+  `rc_claim_for_loading` only takes `FREE`/fresh slots, so a slot is never
+  re-handed to a second fetch until `rc_confirm`/`rc_cancel` ends the fetch. This
+  follows from the state machine, not an eviction-time test.
 - **Staging plane — the real reuse hazard.** The hot path is not zero-copy: a hit
-  is `memcpy`'d from its pool slot into the batch's staging plane (`rc_copy_row`,
-  `_row_cache.c:1089-1092`) and the decode gathers from **staging** bytes, not the
-  pool slot. A pool slot may therefore be evicted and rebound later in the same
-  batch harmlessly, because `store()` rewrites pool bytes only *after* `read()` has
-  copied every hit out (`_row_cache.c:33-35, 1106-1108`) and `DiskRowCache._lock`
+  is `memcpy`'d from its pool slot into the batch's staging plane by
+  `rc_copy_row(stage ← pool)`, called from `py_row_cache_read`, and the decode
+  gathers from **staging** bytes, not the pool slot. A pool slot may therefore be
+  evicted and rebound later in the same batch harmlessly, because
+  `py_row_cache_store` rewrites pool bytes (`rc_copy_row(pool ← miss)`) only
+  *after* `py_row_cache_read` has copied every hit out, and `DiskRowCache._lock`
   serialises the prefetch worker's pool writes with the transaction. The genuine
   use-after-free is on the **shared batch staging buffer**: the next transaction
   must not overwrite a staging slot while an unretired decode from the previous one
@@ -158,7 +214,10 @@ Proven in Quint + Apalache (`slotpool.qnt`):
   outstanding-fetch set (`loading_out`) and the staging buffer's `outstanding`
   pins; the
   implementation must honour the same protocol with per-batch `Event`s.
-- DMA failure / short-read paths (`_ple_reader.c` already guards these).
+- DMA failure / short-read paths — `ple_scatter` in `_ple_reader.c` guards these:
+  a negative CQE result records a `READ_FIXED` error and a short positive read
+  records "short PLE read", while `ple_flush` / `ple_uring_run` set
+  `reader->poisoned` on a submit or completion-wait error and retire the ring.
 
 ## 5. Correctness gates (must pass before this ships on)
 

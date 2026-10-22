@@ -1,4 +1,7 @@
 # CI installs with --no-deps, so Rich's transitive dependencies are explicit.
+# Hypothesis' runtime dependency is explicit for --no-deps CI installs.
+hypothesis>=6
+sortedcontainers>=2.1.0,<3
 markdown-it-py>=2.2.0
 mdurl~=0.1
 pygments>=2.13.0,<3.0.0
