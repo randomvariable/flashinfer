@@ -410,6 +410,7 @@ class DiskRowCache:
                 self.scale_host = self._scale_allocation.host_view
                 self._scale_buffer = memoryview(self.scale_host.numpy())
         self._index = None
+        self._row_cache_failed = False
         if cache_rows:
             self._init_row_cache()
         self._sources: set[tuple[bool, int]] = set()
@@ -573,10 +574,11 @@ class DiskRowCache:
         self._ensure_prefetch_worker()
         if self._prefetch_queue is None:
             return True
-        try:
-            self._prefetch_queue.put_nowait(job)
-        except queue.Full:
-            pass
+        for start in range(0, len(job), self.max_lookups):
+            try:
+                self._prefetch_queue.put_nowait(job[start : start + self.max_lookups])
+            except queue.Full:
+                break
         return True
 
     def _prefetch_ok(self) -> bool:
@@ -588,7 +590,12 @@ class DiskRowCache:
         or a closed one so no worker is ever spawned for a cache that cannot
         hold rows.
         """
-        if self._closed or not self.cache_rows or self._index is None:
+        if (
+            self._closed
+            or self._row_cache_failed
+            or not self.cache_rows
+            or self._index is None
+        ):
             return False
         if self._backend == "gds":
             return False
@@ -672,7 +679,7 @@ class DiskRowCache:
         index = self._index
         reserved: list[tuple[int, int]] = []
         with self._lock:
-            if self._closed:
+            if self._closed or self._row_cache_failed:
                 return
             for key in ids:
                 slot = index.reserve(key)
@@ -700,7 +707,7 @@ class DiskRowCache:
             fetched = False
         planes = [weight_np] + ([scale_np] if scale_np is not None else [])
         with self._lock:
-            if self._closed:
+            if self._closed or self._row_cache_failed:
                 for _, slot in reserved:
                     index.cancel(slot)
                 return
@@ -823,6 +830,8 @@ class DiskRowCache:
         self._ids_ready.record(self._transaction_stream)
 
     def _read_staged(self, count: int) -> None:
+        if self._row_cache_failed:
+            raise RuntimeError("disk row cache is unusable after a failed miss fetch")
         # Completes ID production and all prior cache readers before host writes.
         with torch.cuda.device(self.device):
             self._ids_ready.synchronize()
@@ -855,6 +864,8 @@ class DiskRowCache:
             out[valid] = table[rows]
 
     def _read_cached(self, count: int) -> None:
+        if self._row_cache_failed:
+            raise RuntimeError("disk row cache is unusable after a failed miss fetch")
         # One C call resolves the batch: lookups, counter/ghost/queue
         # mutation, admission evictions, and the hit copies from pool into the
         # bound staging planes. Miss ids land in the bound pinned buffer; the
@@ -865,14 +876,21 @@ class DiskRowCache:
         # batch still reads (RowPlan; docs/DESIGN.md §3), and the transaction's
         # _cache_done fence still gates pool reuse across the decode.
         _, misses = self._index.read(count)
-        if misses:
-            self._fetch(
-                self._miss_ids_view,
-                self._miss_weight_view,
-                self._miss_scale_view,
-                misses,
-            )
-        self._index.store()
+        try:
+            if misses:
+                self._fetch(
+                    self._miss_ids_view,
+                    self._miss_weight_view,
+                    self._miss_scale_view,
+                    misses,
+                )
+            self._index.store()
+        except BaseException:
+            # Admission precedes fetching bytes. Keep the index alive for an
+            # in-flight prefetch job, but never serve its uninitialized slots.
+            self._row_cache_failed = True
+            self._prefetch_stop = True
+            raise
 
     def stats(self) -> dict[str, int | float]:
         self._require_open()
@@ -923,12 +941,16 @@ class DiskRowCache:
                     self.weight_row_bytes + self.scale_row_bytes
                 )
                 index_stats = self._index.stats()
+                index_metadata_bytes = index_stats["metadata_bytes"]
+                result["metadata_bytes"] += index_metadata_bytes
+                result["owned_host_bytes"] += index_metadata_bytes
                 lookups = index_stats["hits"] + index_stats["misses"]
                 result.update(
                     row_cache_tier=self.cache_tier,
                     row_cache_rows=self.cache_rows,
                     row_cache_resident=index_stats["resident"],
                     row_cache_bytes=pool_bytes,
+                    row_cache_metadata_bytes=index_metadata_bytes,
                     row_cache_hits=index_stats["hits"],
                     row_cache_misses=index_stats["misses"],
                     row_cache_hit_rate=(
