@@ -29,6 +29,14 @@ _LOCK = threading.Lock()
 
 
 def _build() -> Path:
+    """Compile ``_row_cache.c`` into the hash-keyed XDG cache dir; return its path.
+
+    The build identity (source bytes, compiler, flags, interpreter) is hashed
+    into the directory name, so a hit reuses a matching shared object and a
+    miss compiles it exactly once, staged through a temporary directory.
+    Raises ``RuntimeError`` on a missing compiler or header and on a failing
+    compile -- the row cache never falls back to Python.
+    """
     source = Path(__file__).with_name("_row_cache.c")
     compiler = shlex.split(os.environ.get("CC", "cc"))
     if not compiler or not shutil.which(compiler[0]):
@@ -92,6 +100,11 @@ def _build() -> Path:
 
 @functools.cache
 def load():
+    """Import the native row-cache module once per process.
+
+    Builds through ``_build`` under ``_LOCK`` and raises ``RuntimeError`` if
+    the extension reports an unexpected ``ABI_VERSION``.
+    """
     with _LOCK:
         spec = importlib.util.spec_from_file_location("_b12x_row_cache", _build())
         module = importlib.util.module_from_spec(spec)

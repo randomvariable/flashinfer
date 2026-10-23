@@ -9,6 +9,7 @@ from b12x.loader._native import load
 
 @pytest.fixture
 def reader_factory():
+    """Return (native, create): a factory for bounded io_uring PLE readers."""
     native = load()
 
     def create(
@@ -20,6 +21,7 @@ def reader_factory():
         scale_bytes,
         capacity,
     ):
+        """Construct one reader, skipping when the host cannot arm PLE io_uring."""
         try:
             return native.ple_reader(
                 shard_rows,
@@ -45,6 +47,7 @@ def reader_factory():
 
 
 def _touched_blocks(block_bytes, spans):
+    """Map byte spans to the block indices a correct reader must touch."""
     blocks = set()
     for offset, size in spans:
         blocks.update(
@@ -75,6 +78,7 @@ def _coalesced_read_counts(blocks, block_bytes):
 
 
 def _expected_rows(payloads, ids, shard_rows, width):
+    """Concatenate the source rows the given global ids must return."""
     return b"".join(
         payloads[row // shard_rows][
             (row % shard_rows) * width : (row % shard_rows + 1) * width
@@ -86,6 +90,7 @@ def _expected_rows(payloads, ids, shard_rows, width):
 def test_cross_block_rows_deduplicate_planes_and_preserve_compact_order(
     tmp_path, reader_factory
 ):
+    """Cross-block plane rows read once per block and keep batch order."""
     native, create = reader_factory
     row_bytes, scale_bytes, rows = 5003, 513, 10
     weights = bytes((i * 17 + i // 257) % 256 for i in range(rows * row_bytes))
@@ -165,6 +170,7 @@ def test_cross_block_rows_deduplicate_planes_and_preserve_compact_order(
 
 
 def test_sparse_requests_never_read_gaps_and_cap_coalescing(tmp_path, reader_factory):
+    """Sparse ids read only their own blocks; long runs split at the 64 KiB cap."""
     native, create = reader_factory
     path = tmp_path / "pages"
     payload = b"".join(bytes([row]) * 4096 for row in range(40))
@@ -188,6 +194,7 @@ def test_sparse_requests_never_read_gaps_and_cap_coalescing(tmp_path, reader_fac
 def test_partial_final_block_and_truncation_drain_before_reuse(
     tmp_path, reader_factory
 ):
+    """A truncated file raises once, and the reader stays reusable after restore."""
     native, create = reader_factory
     path = tmp_path / "partial"
     offset, row_bytes, rows = 107, 509, 80
@@ -212,6 +219,7 @@ def test_partial_final_block_and_truncation_drain_before_reuse(
 
 
 def test_large_source_offsets_keep_exact_rows(tmp_path, reader_factory):
+    """Sources registered past 2**32 still resolve rows byte-exactly."""
     native, create = reader_factory
     offset, rows, width = 2**32 + 4103, 8, 96
     payload = bytes((index * 17) % 256 for index in range(rows * width))
@@ -228,6 +236,7 @@ def test_large_source_offsets_keep_exact_rows(tmp_path, reader_factory):
 
 
 def test_sources_and_destinations_fail_before_unsafe_reads(tmp_path, reader_factory):
+    """Out-of-range, duplicate, oversized, and overlapping arguments fail closed."""
     native, create = reader_factory
     reader = create(4, 4, 0, 4, 16, 0, 4)
     path = tmp_path / "short"
@@ -258,6 +267,7 @@ def test_sources_and_destinations_fail_before_unsafe_reads(tmp_path, reader_fact
 def test_large_mixed_file_batches_preserve_order_and_reuse_allocations(
     tmp_path, reader_factory
 ):
+    """A full-capacity mixed batch keeps order and reuses the same allocations."""
     native, create = reader_factory
     shard_rows, shards = 2048, 2
     row_bytes, scale_bytes, count = 37, 11, 2080
@@ -335,10 +345,12 @@ def test_fragment_sort_is_skipped_only_when_no_merge_can_pay(tmp_path, reader_fa
     paths = [tmp_path / f"shard-{index}" for index in range(file_count)]
 
     def sparse(path, size):
+        """Create a sparse file of ``size`` bytes to host fragment rows."""
         with path.open("wb") as stream:
             stream.truncate(size)
 
     def rows_of(pair_count, stride):
+        """Row indices for adjacent-sector pairs, interleaved so only a sort merges."""
         # The two members of a pair are emitted far apart in wave order, so the
         # adjacency exists in the file but not in the fragment array: only a
         # sort can find it. Each pair starts two sectors after the previous
@@ -378,6 +390,7 @@ def test_fragment_sort_is_skipped_only_when_no_merge_can_pay(tmp_path, reader_fa
         native.ple_reader_add(reader, index, str(path), 0, False)
 
     def run(pair_count):
+        """Fill every file's pair rows, fetch them, and return stats and fragment count."""
         ids, expected = array("q"), bytearray()
         for index, path in enumerate(paths):
             with path.open("rb+") as stream:

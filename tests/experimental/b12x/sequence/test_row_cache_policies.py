@@ -94,6 +94,7 @@ class _PyS3FifoReference:
     _MOVE_TO_MAIN_THRESHOLD = 2
 
     def __init__(self, capacity: int) -> None:
+        """Size the S/M/G budgets; empty the pool, queues, ghosts, and counters."""
         capacity = operator.index(capacity)
         if capacity <= 0:
             raise ValueError("row cache capacity must be positive")
@@ -133,11 +134,13 @@ class _PyS3FifoReference:
         self.misses = 0
 
     def __len__(self) -> int:
+        """Occupied slots: committed rows plus in-flight loading reservations."""
         # Occupied slots, not the high-water mark: a cancelled loading slot
         # sits in the free pool and must not count as resident.
         return len(self._slot) + len(self._loading)
 
     def __contains__(self, key: int) -> bool:
+        """Resident means queued in S or M, never a ghost or a loading row."""
         # Resident means queued: S or M. A ghost is not resident, and neither
         # is a row whose prefetch is still in flight.
         return key in self._slot
@@ -187,6 +190,7 @@ class _PyS3FifoReference:
         self._free.append(slot)
 
     def _demote_ghost(self, key: int) -> None:
+        """Remember ``key`` as a ghost, dropping the oldest entry past the cap."""
         self._ghost[key] = None
         while len(self._ghost) > self._ghost_cap:
             self._ghost.pop(next(iter(self._ghost)))
@@ -241,6 +245,7 @@ class _PyS3FifoReference:
             self._pop_small()
 
     def get(self, key: int) -> int | None:
+        """Look ``key`` up and raise its counter; a lookup never consumes the ghost."""
         # A pure lookup: never consumes the ghost entry. In the C, the ghost
         # is removed by the miss path's find() only to raise hit_on_ghost, and
         # admission (insert) is where it is consumed; a lookup must not erase
@@ -279,6 +284,7 @@ class _PyS3FifoReference:
         return slot
 
     def _claim_for_loading(self) -> int | None:
+        """Take a free or fresh slot, evicting only when a ready row survives."""
         if self._free:
             return self._free.pop()
         if self._used < self.capacity:
@@ -459,6 +465,7 @@ def _c_module():
 
 
 def _payload(key: int, width: int) -> bytes:
+    """Deterministic per-key bytes: a wrong slot or row changes what is staged."""
     # Any deterministic per-key byte pattern: a slot quietly reassigned within
     # a batch, or a store landing on the wrong row, changes the staged bytes.
     return bytes(((key >> (8 * (i % 8))) ^ (i * 31 + 7)) & 0xFF for i in range(width))
@@ -475,6 +482,7 @@ class _Pair:
     """
 
     def __init__(self, capacity: int, max_lookups: int, weight: int, scale: int):
+        """Build oracle and C index sides over mirrored caller-owned buffers."""
         native = _c_module()
         self.native = native
         self.capacity = capacity
@@ -498,6 +506,7 @@ class _Pair:
         )
 
     def _fill_miss(self, side: int, keys: list[int]) -> None:
+        """Write the source pattern into one side's fetched-miss planes."""
         for row, key in enumerate(keys):
             for plane, width in zip(self.miss[side], self.widths):
                 plane[row][:] = np.frombuffer(_payload(key, width), np.uint8)
@@ -529,16 +538,19 @@ class _Pair:
         return plan
 
     def reserve(self, key: int) -> tuple[int | None, int | None]:
+        """Reserve on both sides and require the same slot (or both None)."""
         ref_slot = self.ref.reserve(key)
         c_slot = self.native.row_cache_reserve(self.rc, key)
         assert ref_slot == c_slot, ("reserve", key, ref_slot, c_slot)
         return ref_slot, c_slot
 
     def cancel(self, slot: int) -> None:
+        """Drop a loading reservation on both sides."""
         self.ref.cancel(slot)
         self.native.row_cache_cancel(self.rc, slot)
 
     def confirm(self, key: int, slot: int) -> None:
+        """Fill the reserved slot's pool bytes, then confirm on both sides."""
         # Mirror _run_prefetch_job: the worker writes the fetched bytes into
         # the reserved slot (both pools identically) before confirming.
         for side in (0, 1):
@@ -670,6 +682,7 @@ def _metadata_of(native, capacity: int, max_lookups: int, widths=(4, 2)):
     """
 
     def plane(count, width):
+        """Allocate a caller-owned plane the index must never bill as metadata."""
         # Caller-owned memory: none of this belongs in the index's number.
         return np.zeros((count, width), np.uint8)
 
@@ -708,6 +721,7 @@ def test_build_failure_raises_not_falls_back(monkeypatch):
     from b12x.sequence._shared.row_cache import S3FifoRowCache
 
     def boom():
+        """Stand in for a native build that cannot succeed."""
         raise RuntimeError("b12x row cache native build failed: simulated")
 
     monkeypatch.setattr(_row_cache_native, "load", boom)
@@ -725,6 +739,7 @@ def test_build_failure_raises_not_falls_back(monkeypatch):
 
 
 def test_facade_rejects_bad_capacity():
+    """Zero and negative capacities are rejected by the facade before the C call."""
     from b12x.sequence._shared.row_cache import S3FifoRowCache
 
     alloc = lambda rows, width: np.zeros((rows, width), np.uint8)  # noqa: E731
@@ -746,6 +761,7 @@ def test_facade_rejects_bad_capacity():
 
 
 def _pair(capacity, max_lookups=40, weight=4, scale=2):
+    """Build a parity pair with the widths most tests default to."""
     return _Pair(capacity, max_lookups, weight, scale)
 
 
@@ -910,6 +926,7 @@ def test_random_churn_with_prefetch_lifecycle():
 
 
 def _lcs_all_prefix(count: int) -> list[int] | None:
+    """First ``count`` ids of the production trace, or None when the corpus is absent."""
     from pathlib import Path
 
     path = Path(_LCS_ALL).expanduser()
@@ -948,6 +965,7 @@ def test_lcs_all_prefix_matches_reference():
 
 
 def test_stats_surface():
+    """Stats expose counters, budgets, and the footprint over a deduped batch."""
     pair = _pair(16)
     pair.serve([1, 2, 3, 1])  # the repeated 1 is a deduped miss, not a hit
     stats = pair.native.row_cache_stats(pair.rc)
@@ -1141,6 +1159,7 @@ def test_metadata_bytes_counts_logical_bytes_on_the_huge_page_path(
 
 
 def test_resolve_row_cache_size_precedence():
+    """BYTES beats ROWS beats the tier default; empty is unset, both set is an error."""
     from b12x.sequence._shared.disk_table import _resolve_row_cache_size
 
     # Nothing set: off, exactly the historical default.
@@ -1167,6 +1186,7 @@ def test_resolve_row_cache_size_precedence():
 
 
 def test_validate_row_cache_tier():
+    """Only the host tier exists, accepted case-insensitively and blank-normalised."""
     from b12x.sequence._shared.disk_table import _validate_row_cache_tier
 
     assert _validate_row_cache_tier(None) == "host"
