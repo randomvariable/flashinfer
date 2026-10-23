@@ -697,9 +697,8 @@ class DiskRowCache:
     def _ensure_prefetch_worker(self) -> None:
         """Start the bounded prefetch queue and daemon worker on first use.
 
-        No-ops when the worker already exists or the cache is closed; the
-        thread starts outside ``_lock`` so the queue is published before the
-        worker can observe it.
+        Start and publish under ``_lock`` so close cannot observe an unstarted
+        thread. No-ops when the worker already exists or the cache is closed.
         """
         with self._lock:
             if self._prefetch_thread is not None or self._closed:
@@ -711,8 +710,8 @@ class DiskRowCache:
                 name="b12x-ple-prefetch",
                 daemon=True,
             )
+            worker.start()
             self._prefetch_thread = worker
-        worker.start()
 
     def _prefetch_loop(self) -> None:
         """Drain the prefetch queue until stopped or handed the close sentinel.
