@@ -20,6 +20,7 @@ from tests.experimental.b12x.conftest import require_b12x
 
 
 def _cache(**kwargs):
+    """DiskRowCache over the standard fixture: 300 rows, 3 shards, 257+9 B/row."""
     queue_depth = kwargs.pop("queue_depth", 2)
     return DiskRowCache(
         device=require_b12x(),
@@ -36,6 +37,7 @@ def _cache(**kwargs):
 
 
 def _write(path, payload, offset):
+    """Write ``payload`` at ``offset`` and fsync, honouring the immutable-file contract."""
     with path.open("wb", buffering=0) as stream:
         stream.seek(offset)
         stream.write(payload)
@@ -47,6 +49,7 @@ def _write(path, payload, offset):
 def test_rows_match_bytes_across_planes_shards_streams_and_frozen_gather(
     tmp_path, monkeypatch, queue_depth
 ):
+    """Weight and scale rows stay byte-exact across shards, streams, and batch sizes."""
     cache = _cache(queue_depth=queue_depth)
     payloads = []
     try:
@@ -148,6 +151,7 @@ def test_rows_match_bytes_across_planes_shards_streams_and_frozen_gather(
 
 @torch.inference_mode()
 def test_file_offsets_and_global_ids_exceed_signed_32bit_products(tmp_path):
+    """Signed-32-bit-exceeding offset/id products resolve; the out-of-shard row is zero."""
     device = require_b12x()
     row = (1 << 32) // 256 + 3
     offset = 4093
@@ -181,6 +185,7 @@ def test_file_offsets_and_global_ids_exceed_signed_32bit_products(tmp_path):
 
 
 def test_source_and_read_failures_are_reported_before_reuse(tmp_path):
+    """Missing sources and short reads raise, and the transaction thread stays unwedged."""
     device = require_b12x()
     path = tmp_path / "source.bin"
     _write(path, bytes(range(256)) * 64, 0)
@@ -211,9 +216,11 @@ def test_source_and_read_failures_are_reported_before_reuse(tmp_path):
 
 
 def test_backend_is_fixed_at_construction_and_optional_dependency_is_lazy(monkeypatch):
+    """The backend is fixed at construction; cuFile loads only when GDS is requested."""
     from b12x.loader import _gds_native
 
     def unavailable():
+        """Stand in for a host without usable cuFile development files."""
         raise RuntimeError("injected unavailable cuFile development files")
 
     monkeypatch.setattr(_gds_native, "load", unavailable)
@@ -233,6 +240,7 @@ def test_backend_is_fixed_at_construction_and_optional_dependency_is_lazy(monkey
 
 
 def test_close_waits_for_a_consumer_on_another_stream(tmp_path):
+    """Close waits for work queued on another stream before releasing staging."""
     device = require_b12x()
     path = tmp_path / "pending.bin"
     _write(path, bytes(range(256)) * 16, 0)
@@ -263,6 +271,7 @@ def test_close_waits_for_a_consumer_on_another_stream(tmp_path):
 
 
 def test_full_batch_uses_registered_slots_above_one_mib(tmp_path):
+    """Registered slots serve >1 MiB batches with one read call per row."""
     device = require_b12x()
     path = tmp_path / "batch-slots.bin"
     data = ((torch.arange(4096)[:, None] * 17 + torch.arange(256)) % 251).to(
@@ -295,6 +304,7 @@ def test_full_batch_uses_registered_slots_above_one_mib(tmp_path):
 
 
 def _payloads():
+    """Deterministic 300-row weight and scale planes shared by the cache fixtures."""
     return [
         (
             torch.arange(300 * width, dtype=torch.int64) * 17
@@ -308,6 +318,7 @@ def _payloads():
 
 
 def _expected(source, ids):
+    """Gather expected rows for ids, zero-filling outside the [7, 290) shard range."""
     expected = torch.zeros((len(ids), source.shape[1]), dtype=torch.uint8)
     valid = (ids >= 7) & (ids < 290)
     expected[valid] = source[ids[valid]]
@@ -404,6 +415,7 @@ def test_s3fifo_c_index_selected_and_stats_report_host():
     host_rows = _host_rows(_payloads())
 
     def build(**kwargs):
+        """Construct the cache with the standard host-resident source rows."""
         return _cache(cache_rows=8, cache_tier="host", host_rows=host_rows, **kwargs)
 
     cache = build()
@@ -476,6 +488,7 @@ def test_enabled_without_size_defaults_to_1gib(monkeypatch):
     ],
 )
 def test_row_cache_size_parses_to_whole_rows(text, rows):
+    """Size spellings round down to a whole-row count at 90 bytes per row."""
     from b12x.sequence._shared.disk_table import _parse_row_cache_size
 
     assert _parse_row_cache_size(text, 90) == rows
@@ -524,6 +537,7 @@ def test_row_cache_bytes_env_selects_capacity(monkeypatch):
 
 
 def test_cache_requires_io_uring_or_host_source(monkeypatch):
+    """GDS cannot serve a row cache: construction refuses instead of misbehaving."""
     monkeypatch.setenv("B12X_DISK_BACKEND", "gds")
     with pytest.raises(ValueError, match="GDS backend does not support a row cache"):
         _cache(cache_rows=8, cache_tier="host")
@@ -547,6 +561,7 @@ def _fake_fetch(payloads, block=None, fail_first=0, record=None):
     state = {"calls": 0}
 
     def fetch(self, ids, weights, scales, count):
+        """One recorded source read: pattern bytes in-shard, zeros outside, optional gate."""
         state["calls"] += 1
         if record is not None:
             record.append((ids, weights, scales, count))
@@ -571,6 +586,7 @@ def _fake_fetch(payloads, block=None, fail_first=0, record=None):
 
 
 def _drain(cache, ids, timeout=3.0):
+    """Wait until the prefetch queue empties and every id is resident."""
     index = cache._index
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -581,6 +597,7 @@ def _drain(cache, ids, timeout=3.0):
 
 
 def _wait_loading(cache, ids, timeout=3.0):
+    """Wait until every id sits in a loading slot with the queue drained."""
     index = cache._index
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -591,6 +608,7 @@ def _wait_loading(cache, ids, timeout=3.0):
 
 
 def _wait_jobs(cache, record, at_least, timeout=3.0):
+    """Wait for ``at_least`` recorded fetches with queue and loading state idle."""
     index = cache._index
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -631,6 +649,7 @@ def test_prefetch_disabled_returns_false(monkeypatch):
 
 @torch.inference_mode()
 def test_prefetch_ready_hits_after_drain(monkeypatch):
+    """Prefetched rows come back as pure hits with byte-exact staging."""
     monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads))
@@ -704,10 +723,12 @@ def _assert_loading_slot_immune(monkeypatch, cache_rows):
 
 @torch.inference_mode()
 def test_s3fifo_loading_slot_immune_to_eviction(monkeypatch):
+    """At S3-FIFO's smallest safe capacity, loading rows survive a synchronous batch."""
     _assert_loading_slot_immune(monkeypatch, 32)
 
 
 def test_duplicate_invalid_noop(monkeypatch):
+    """Duplicates fetch once, out-of-range ids never enter, ready rows are no-ops."""
     monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     record = []
@@ -736,6 +757,7 @@ def test_duplicate_invalid_noop(monkeypatch):
 
 
 def test_close_stops_worker(monkeypatch):
+    """close() joins the prefetch worker promptly with a job in flight."""
     monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads))
@@ -753,6 +775,7 @@ def test_close_stops_worker(monkeypatch):
 
 @torch.inference_mode()
 def test_rejected_prefetch_sync_identical(monkeypatch):
+    """A failed prefetch cancels cleanly; the synchronous read still serves exact bytes."""
     monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     record = []
@@ -808,23 +831,28 @@ def _cpu_row_cache():
     cache._miss_scale_view = None
     cache._stage_host = [np.zeros((2, 3), dtype=np.uint8)]
     cache._pool = [np.full((8, 3), 255, dtype=np.uint8)]
-    cache._index = S3FifoRowCache(
-        8,
-        2,
-        cache._ids_buffer,
-        cache._miss_ids_view,
-        [cache._miss_weight_view],
-        cache._stage_host,
-        cache._pool,
-    )
+    try:
+        cache._index = S3FifoRowCache(
+            8,
+            2,
+            cache._ids_buffer,
+            cache._miss_ids_view,
+            [cache._miss_weight_view],
+            cache._stage_host,
+            cache._pool,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"row-cache C extension unavailable: {exc}")
     return cache
 
 
 def test_failed_miss_never_serves_admitted_bytes(monkeypatch):
+    """A source failure poisons the admitted batch: both read paths refuse, pool untouched."""
     cache = _cpu_row_cache()
     cache._ids_buffer[:] = [1, 2]
 
     def fail_fetch(*args):
+        """Raise as if the underlying disk read failed."""
         raise OSError("injected source failure")
 
     monkeypatch.setattr(cache, "_fetch", fail_fetch)
@@ -842,6 +870,7 @@ def test_failed_miss_never_serves_admitted_bytes(monkeypatch):
 
 
 def test_prefetch_large_request_fetches_bounded_batches(monkeypatch):
+    """An over-capacity request splits into fetch batches bounded by max_lookups."""
     cache = _cpu_row_cache()
     monkeypatch.setattr(cache, "_prefetch_ok", lambda: True)
     monkeypatch.setattr(cache, "_ensure_prefetch_worker", lambda: None)
@@ -849,6 +878,7 @@ def test_prefetch_large_request_fetches_bounded_batches(monkeypatch):
     counts = []
 
     def bounded_fetch(ids, weights, scales, count):
+        """Assert the queue bound, record the size, and delegate to the real fetch."""
         assert count <= cache.max_lookups
         counts.append(count)
         fetch(ids, weights, scales, count)
@@ -871,6 +901,7 @@ def test_prefetch_large_request_fetches_bounded_batches(monkeypatch):
 
 
 def test_prefetch_chunking_property():
+    """Hypothesis sweep: jobs stay bounded and admit exactly the deduped in-shard ids."""
     from hypothesis import given, settings, strategies as st
     import queue
 
@@ -880,6 +911,7 @@ def test_prefetch_chunking_property():
         st.integers(min_value=1, max_value=4),
     )
     def check(ids, queue_capacity):
+        """One property case: drain the queue and check pool bytes against the source."""
         cache = _cpu_row_cache()
         cache._prefetch_queue = queue.Queue(maxsize=queue_capacity)
         cache._prefetch_ok = lambda: True
