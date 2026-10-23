@@ -940,3 +940,56 @@ def test_prefetch_chunking_property():
             cache._index.close()
 
     check()
+
+
+def test_close_cannot_join_unstarted_prefetch_worker(monkeypatch):
+    """Closing during worker startup waits until the thread can be joined."""
+    cache = DiskRowCache.__new__(DiskRowCache)
+    cache._closed = False
+    cache._lock = threading.RLock()
+    cache._prefetch_thread = None
+    cache._transaction_thread = None
+    cache._cache_used = False
+    cache._gds = cache._index = None
+    cache._scale_allocation = cache._weight_allocation = None
+    starting = threading.Event()
+    release = threading.Event()
+    closing = threading.Event()
+    errors = []
+    original_start = threading.Thread.start
+
+    def delayed_start(worker):
+        """Pause only the prefetch worker before the real Thread.start call."""
+        if worker.name == "b12x-ple-prefetch":
+            starting.set()
+            assert release.wait(5)
+        original_start(worker)
+
+    def close_cache():
+        """Capture shutdown errors instead of losing them in another thread."""
+        closing.set()
+        try:
+            cache.close()
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(threading.Thread, "start", delayed_start)
+    starter = threading.Thread(target=cache._ensure_prefetch_worker)
+    closer = threading.Thread(target=close_cache)
+    try:
+        starter.start()
+        assert starting.wait(5)
+        closer.start()
+        assert closing.wait(5)
+        # Even before shutdown acquires the lock, no unstarted thread is visible.
+        assert cache._prefetch_thread is None
+    finally:
+        release.set()
+        starter.join(5)
+        if closer.ident is not None:
+            closer.join(5)
+        cache.close()
+    assert not starter.is_alive() and not closer.is_alive()
+    assert errors == []
+    assert cache._prefetch_thread is not None
+    assert not cache._prefetch_thread.is_alive()
