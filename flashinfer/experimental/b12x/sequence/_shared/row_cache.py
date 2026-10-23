@@ -109,6 +109,15 @@ class S3FifoRowCache:
         stage_planes,
         pool_planes,
     ) -> None:
+        """Build the C index over caller-owned buffers.
+
+        ``capacity`` is pool slots (rows) and ``max_lookups`` the largest
+        batch the buffers can hold. ``ids``, ``miss_ids``, ``miss_planes``,
+        ``stage_planes`` and ``pool_planes`` are bound zero-copy for the
+        index's lifetime, so the caller must keep them alive and untouched
+        outside these methods. Raises ``ValueError`` on a non-positive size
+        and ``RuntimeError`` when the native extension cannot be built.
+        """
         capacity = operator.index(capacity)
         if capacity <= 0:
             raise ValueError("row cache capacity must be positive")
@@ -133,9 +142,11 @@ class S3FifoRowCache:
 
     @property
     def capacity(self) -> int:
+        """Pool slots (rows) the index can hold at once."""
         return self._capacity
 
     def _capsule(self):
+        """The live capsule, or ``RuntimeError`` after ``close``."""
         if self._rc is None:
             raise RuntimeError("row cache is closed")
         return self._rc
@@ -229,20 +240,24 @@ class S3FifoRowCache:
 
     @property
     def hits(self) -> int:
+        """Rows served from the cache since construction."""
         return self.stats()["hits"]
 
     @property
     def misses(self) -> int:
+        """Rows handed to the source fetch since construction."""
         return self.stats()["misses"]
 
     def __len__(self) -> int:
-        # Occupied slots: a cancelled loading slot must not count as resident.
+        """Resident (READY) rows; loading and cancelled slots are excluded."""
         return self.stats()["resident"]
 
     def __contains__(self, key: int) -> bool:
+        """Whether ``key`` currently holds a committed (READY) row."""
         return self.is_ready(key)
 
     def close(self) -> None:
+        """Drop the capsule and buffer bindings; later calls raise."""
         self._rc = None
         self._native = None
         self._ids_view = None
