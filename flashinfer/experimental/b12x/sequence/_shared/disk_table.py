@@ -299,14 +299,11 @@ class DiskRowCache:
       fails to build — there is no silent fallback. The A/B arm for "cache
       off" is ``B12X_ROW_CACHE_ROWS=0``; the pre-port Python-path cost model
       is in ``docs/DESIGN.md`` §1.
-    * ``B12X_PLE_PREFETCH`` — nonzero turns the ``prefetch`` worker on. Under
-      vLLM the runner hook is gated separately by ``VLLM_PLE_PREFETCH``; both
-      must be set.
 
     The GDS backend stages on the device itself and is not cached.
 
     ``prefetch(ids)`` warms the cache ahead of the read path from a background
-    worker, driven by ``B12X_PLE_PREFETCH`` (off by default). Reserved rows sit
+    worker that starts on the first call. Reserved rows sit
     in a loading slot that a lookup never hits and eviction never reclaims;
     only a confirmed row becomes a ready hit. The synchronous read path treats
     an in-flight prefetch as a plain miss and takes its own fetch, so the same
@@ -610,9 +607,9 @@ class DiskRowCache:
         Advisory only: it never touches the staging buffer, never raises, and
         hands the work to a single lazily-started daemon worker over a bounded
         queue, so callers are never stalled behind disk I/O. Returns ``False``
-        when the row cache is disabled (``cache_rows == 0``) or the
-        ``B12X_PLE_PREFETCH`` environment variable is unset or ``"0"``;
-        otherwise ``True``. ``ids`` may be a list of ints, a CPU int64 tensor,
+        when the row cache is disabled (``cache_rows == 0``), closed, or on the
+        GDS backend; otherwise ``True``. Calling it is the opt-in; there is no
+        separate enable flag. ``ids`` may be a list of ints, a CPU int64 tensor,
         or a numpy array; duplicate, out-of-shard, and already-handled ids are
         no-ops. When the queue is saturated the newest request is dropped.
         """
@@ -632,13 +629,11 @@ class DiskRowCache:
         return True
 
     def _prefetch_ok(self) -> bool:
-        """Gate speculative prefetch: cache enabled, disk/host backend, opt-in env.
+        """Gate speculative prefetch: open cache with rows, disk/host backend.
 
-        ``b12x`` has no ``vllm`` env module, so the flag is read straight from
-        ``os.environ``. It defaults to off; only a set, nonzero value turns
-        prefetch on. Returns ``False`` for a disabled cache (``cache_rows == 0``)
-        or a closed one so no worker is ever spawned for a cache that cannot
-        hold rows.
+        Returns ``False`` for a disabled cache (``cache_rows == 0``), a closed
+        or failed one, or the GDS backend, so no worker is ever spawned for a
+        cache that cannot hold rows.
         """
         if (
             self._closed
@@ -649,8 +644,7 @@ class DiskRowCache:
             return False
         if self._backend == "gds":
             return False
-        flag = os.environ.get("B12X_PLE_PREFETCH")
-        return flag is not None and flag != "0"
+        return True
 
     def _normalize_prefetch_ids(self, ids) -> list[int]:
         """Coerce ``ids`` to the distinct in-shard, not-yet-cached row ids.

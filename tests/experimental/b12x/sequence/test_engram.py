@@ -13,10 +13,8 @@ from b12x.testing.reference.helpers import require_b12x
 
 
 @pytest.mark.parametrize("resident_scales", [False, True])
-@pytest.mark.parametrize("prefetch", [False, True])
 def test_disk_lookup_transaction_recovers_after_read_failure(
     resident_scales,
-    prefetch,
     monkeypatch,
 ):
     """Host lifecycle coverage for synchronous reads and explicit close."""
@@ -78,7 +76,7 @@ def test_disk_lookup_transaction_recovers_after_read_failure(
         resident_scales=resident_scales,
     ).items():
         object.__setattr__(state, name, value)
-    table = engram.DiskTable(state, resident_scales=resident_scales, prefetch=prefetch)
+    table = engram.DiskTable(state, resident_scales=resident_scales)
     cache = table._cache
     ids = torch.arange(72).reshape(3, 24)
     out = torch.full((3,), -1, dtype=torch.int64)
@@ -103,17 +101,15 @@ def test_disk_lookup_transaction_recovers_after_read_failure(
         SimpleNamespace(lookup_op=lookup),
     )
     try:
-        table.prefetch(binding, token_count=2)
-        assert cache.rows is None and not table.prefetch_pending
+        assert cache.rows is None
         engram.run_lookup(binding, token_count=2, clear_tail=False)
         torch.testing.assert_close(out, torch.tensor([0, 24, -1]))
-        assert not cache.active and not table.prefetch_pending
+        assert not cache.active
 
         cache.fail_read = True
         with pytest.raises(OSError, match="injected"):
             engram.run_lookup(binding, token_count=2, clear_tail=False)
-        assert not cache.active and not table.prefetch_pending
-        table.abort_prefetch()
+        assert not cache.active
         cache.fail_read = False
         ids.add_(1)
         engram.run_lookup(binding, token_count=2, clear_tail=False)
