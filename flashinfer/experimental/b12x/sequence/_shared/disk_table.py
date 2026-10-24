@@ -616,6 +616,8 @@ class DiskRowCache:
         if not self._prefetch_ok():
             return False
         job = self._normalize_prefetch_ids(ids)
+        if job is None:
+            return False
         if not job:
             return True
         self._ensure_prefetch_worker()
@@ -646,7 +648,7 @@ class DiskRowCache:
             return False
         return True
 
-    def _normalize_prefetch_ids(self, ids) -> list[int]:
+    def _normalize_prefetch_ids(self, ids) -> list[int] | None:
         """Coerce ``ids`` to the distinct in-shard, not-yet-cached row ids.
 
         Accepts a list of ints, a CPU int64 tensor, or a numpy array; every
@@ -655,6 +657,11 @@ class DiskRowCache:
         ids already committed are dropped as no-ops. Rows merely loading are
         left in: their ``reserve`` returns ``None`` in the worker, so they cost
         a cheap no-op rather than a second fetch.
+
+        The index handle is read under ``_lock``, the same lock ``close``
+        holds while it drops the index, so a ``close`` that wins the race
+        makes this return ``None`` rather than calling ``is_ready`` on a
+        closed cache.
         """
         import numpy as np
 
@@ -671,11 +678,13 @@ class DiskRowCache:
             raw = ids.reshape(-1).tolist()
         else:
             raw = list(ids)
-        low, high = self.shard_start, self.shard_end
-        index = self._index
-        seen: set[int] = set()
-        result: list[int] = []
         with self._lock:
+            if self._index is None:
+                return None
+            index = self._index
+            low, high = self.shard_start, self.shard_end
+            seen: set[int] = set()
+            result: list[int] = []
             for value in raw:
                 key = int(value)
                 if key in seen:

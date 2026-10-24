@@ -828,6 +828,21 @@ def _cpu_row_cache():
     return cache
 
 
+def test_prefetch_reports_close_winning_the_race():
+    """A dropped index is reported as inactive, and ``prefetch`` never raises."""
+    cache = _cpu_row_cache()
+    cache._prefetch_ok = lambda: True
+    live = cache._index
+    try:
+        assert cache._normalize_prefetch_ids([1, 2, 3]) == [1, 2, 3]
+        cache._index = None  # What close() leaves behind, set under ``_lock``.
+        assert cache._normalize_prefetch_ids([1, 2, 3]) is None
+        assert cache.prefetch([1, 2, 3]) is False
+    finally:
+        cache._index = live
+        cache._index.close()
+
+
 def test_failed_miss_never_serves_admitted_bytes(monkeypatch):
     """A source failure poisons the admitted batch: both read paths refuse, pool untouched."""
     cache = _cpu_row_cache()
