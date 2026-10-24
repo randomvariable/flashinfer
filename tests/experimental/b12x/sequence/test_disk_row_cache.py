@@ -622,23 +622,10 @@ def _wait_jobs(cache, record, at_least, timeout=3.0):
     raise AssertionError(f"prefetch jobs did not settle (calls={len(record)})")
 
 
-def test_prefetch_disabled_returns_false(monkeypatch):
-    """Env unset / "0" and a zero-row cache never fetch and never spawn a thread."""
-    monkeypatch.delenv("B12X_PLE_PREFETCH", raising=False)
-    payloads = _payloads()
-    host_rows = _host_rows(payloads)
+def test_prefetch_zero_row_cache_returns_false():
+    """A zero-row cache never fetches and never spawns a thread."""
     before = threading.active_count()
-    cache = _cache(cache_rows=16, cache_tier="host", host_rows=host_rows)
-    try:
-        assert cache.prefetch([7, 8, 9]) is False
-        assert cache._prefetch_thread is None
-        monkeypatch.setenv("B12X_PLE_PREFETCH", "0")
-        assert cache.prefetch([7, 8, 9]) is False
-        assert cache._prefetch_thread is None
-    finally:
-        cache.close()
-    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
-    zero = _cache(cache_rows=0, cache_tier="host", host_rows=host_rows)
+    zero = _cache(cache_rows=0, cache_tier="host", host_rows=_host_rows(_payloads()))
     try:
         assert zero.prefetch([7, 8]) is False
         assert zero._prefetch_thread is None
@@ -650,7 +637,6 @@ def test_prefetch_disabled_returns_false(monkeypatch):
 @torch.inference_mode()
 def test_prefetch_ready_hits_after_drain(monkeypatch):
     """Prefetched rows come back as pure hits with byte-exact staging."""
-    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads))
     cache = _cache(cache_rows=32, cache_tier="host", host_rows=_host_rows(payloads))
@@ -687,7 +673,6 @@ def _assert_loading_slot_immune(monkeypatch, cache_rows):
     smallest cache that can hold all three prefetched ids once the
     synchronous batch has run through S.
     """
-    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     gate = threading.Event()
     monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads, block=gate))
@@ -729,7 +714,6 @@ def test_s3fifo_loading_slot_immune_to_eviction(monkeypatch):
 
 def test_duplicate_invalid_noop(monkeypatch):
     """Duplicates fetch once, out-of-range ids never enter, ready rows are no-ops."""
-    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     record = []
     monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads, record=record))
@@ -758,7 +742,6 @@ def test_duplicate_invalid_noop(monkeypatch):
 
 def test_close_stops_worker(monkeypatch):
     """close() joins the prefetch worker promptly with a job in flight."""
-    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     monkeypatch.setattr(DiskRowCache, "_fetch", _fake_fetch(payloads))
     cache = _cache(cache_rows=16, cache_tier="host", host_rows=_host_rows(payloads))
@@ -776,7 +759,6 @@ def test_close_stops_worker(monkeypatch):
 @torch.inference_mode()
 def test_rejected_prefetch_sync_identical(monkeypatch):
     """A failed prefetch cancels cleanly; the synchronous read still serves exact bytes."""
-    monkeypatch.setenv("B12X_PLE_PREFETCH", "1")
     payloads = _payloads()
     record = []
     # The worker's first fetch fails; the synchronous read must still succeed.
