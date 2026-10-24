@@ -98,6 +98,10 @@ class DiskTable:
         """Byte budgets and row-cache counters, delegated to ``DiskRowCache``."""
         return self._cache.stats()
 
+    def prefetch(self, ids) -> bool:
+        """Advisory warm of global row ``ids`` into the row cache; see ``DiskRowCache.prefetch``."""
+        return self._cache.prefetch(ids)
+
     def _run(self, binding: Binding, *, state, token_count: int) -> None:
         """Hash tokens to row ids, read those rows, and decode in one transaction.
 

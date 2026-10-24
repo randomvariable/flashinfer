@@ -8,7 +8,7 @@ import torch
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ._impl import LookupBinding, _State
+    from ._impl import _State
 
 
 def _require_disk_eager(device: torch.device) -> None:
@@ -32,8 +32,8 @@ class DiskTable:
 
     resident_scales retains the owned original E8M0 bytes in mapped host RAM
     and removes scale-plane disk reads. It is opt-in; callers must budget
-    scale RAM. Disk lookup is synchronous. The prefetch argument and methods
-    are accepted as no-ops for callers that still pass them.
+    scale RAM. Disk lookup is synchronous. ``prefetch(ids)`` warms the shared
+    row cache ahead of lookup; see ``DiskRowCache.prefetch``.
     """
 
     def __init__(
@@ -43,7 +43,6 @@ class DiskTable:
         queue_depth: int = 128,
         *,
         resident_scales: bool = False,
-        prefetch: bool = False,
     ) -> None:
         from .._shared.disk_table import DiskRowCache, MappedHostAllocation
 
@@ -54,8 +53,8 @@ class DiskTable:
         if state.caps.device.type != "cuda":
             raise ValueError("disk Engram requires CUDA")
         _require_disk_eager(state.caps.device)
-        if not isinstance(resident_scales, bool) or not isinstance(prefetch, bool):
-            raise TypeError("resident_scales and prefetch must be bool")
+        if not isinstance(resident_scales, bool):
+            raise TypeError("resident_scales must be bool")
         self.state = state
         self._closed = False
         if not state.compact_rows or state.resident_scales != resident_scales:
@@ -86,17 +85,6 @@ class DiskTable:
             )
             self._scale_owner.host_view.zero_()
             self.scale_bytes = self._scale_owner.device_view
-
-    @property
-    def prefetch_pending(self) -> bool:
-        """No disk reads remain pending between synchronous lookups."""
-        return False
-
-    def prefetch(self, binding: LookupBinding, token_count: int) -> None:
-        """No-op; run_lookup reads and consumes the requested rows."""
-
-    def abort_prefetch(self) -> None:
-        """No-op; synchronous lookup owns its entire transaction."""
 
     def close(self) -> None:
         if getattr(self, "_closed", True):
@@ -191,3 +179,7 @@ class DiskTable:
             result["owned_host_bytes"] + result["resident_scale_bytes"]
         )
         return result
+
+    def prefetch(self, ids) -> bool:
+        """Advisory warm of global row ``ids`` into the row cache; see ``DiskRowCache.prefetch``."""
+        return self._cache.prefetch(ids)
