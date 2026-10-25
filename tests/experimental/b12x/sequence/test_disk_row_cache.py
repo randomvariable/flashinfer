@@ -7,6 +7,7 @@ qualify cuFile. A selected but unavailable transport fails instead of skipping.
 from __future__ import annotations
 
 import os
+import queue
 import random
 import threading
 import time
@@ -805,7 +806,9 @@ def _cpu_row_cache():
     cache._host_weight = np.arange(24, dtype=np.uint8).reshape(8, 3)
     cache._host_scale = None
     cache._lock = threading.RLock()
-    cache._prefetch_stop = False
+    cache._init_prefetch_state()
+    # A real bounded queue stands in for the lazily started worker, so these
+    # tests can watch what prefetch hands over without spawning a thread.
     cache._prefetch_queue = queue.Queue(maxsize=64)
     cache._ids_buffer = np.zeros(2, dtype=np.int64)
     cache._miss_ids_view = np.zeros(2, dtype=np.int64)
@@ -813,6 +816,15 @@ def _cpu_row_cache():
     cache._miss_scale_view = None
     cache._stage_host = [np.zeros((2, 3), dtype=np.uint8)]
     cache._pool = [np.full((8, 3), 255, dtype=np.uint8)]
+    # What ``stats()`` folds in besides the index: no reader here, so those
+    # terms stay zero, and the staging views only need their sizes.
+    cache._gds = None
+    cache._native = None
+    cache._reader = None
+    cache.cache_tier = "host"
+    cache.ids_host = torch.zeros(2, dtype=torch.int64)
+    cache.weight = torch.zeros((2, 3), dtype=torch.uint8)
+    cache.scale = None
     try:
         cache._index = S3FifoRowCache(
             8,
@@ -990,3 +1002,113 @@ def test_close_cannot_join_unstarted_prefetch_worker(monkeypatch):
     assert errors == []
     assert cache._prefetch_thread is not None
     assert not cache._prefetch_thread.is_alive()
+
+
+class _SaturatedQueue:
+    """A prefetch queue that accepts nothing, as a worker falling behind looks."""
+
+    def __init__(self, depth=64):
+        self.depth = depth
+
+    def qsize(self):
+        return self.depth
+
+    def put_nowait(self, job):
+        raise queue.Full()
+
+
+def test_prefetch_reports_warm_skips_and_rows_dropped_on_a_full_queue():
+    """Every row prefetch accepted is reported as queued or dropped, never lost."""
+    cache = _cpu_row_cache()
+    cache._closed = False  # ``stats`` refuses a closed cache.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(cache, "_prefetch_ok", lambda: True)
+    monkeypatch.setattr(cache, "_ensure_prefetch_worker", lambda: None)
+    try:
+        cache._run_prefetch_job([1, 2])  # Publish two rows the way the worker does.
+        assert cache.prefetch([1, 2, 3]) is True
+
+        snapshot = cache.stats()
+        assert snapshot["prefetch_requests"] == 1
+        # Rows 1 and 2 are resident, so only row 3 is real work.
+        assert snapshot["prefetch_rows_already_cached"] == 2
+        assert snapshot["prefetch_rows"] == 1
+        assert snapshot["prefetch_rows_queued"] == 1
+        assert snapshot["prefetch_rows_dropped"] == 0
+        assert snapshot["prefetch_queue_depth"] == 1
+        assert snapshot["prefetch_worker_started"] == 0
+        assert snapshot["prefetch_enabled"] == 1
+        assert snapshot["prefetch_rows_loaded"] == 2
+
+        cache._prefetch_queue = _SaturatedQueue()
+        assert cache.prefetch([4, 5, 6, 7]) is True
+        after = cache.stats()
+        assert after["prefetch_rows_dropped"] == 4
+        assert (
+            after["prefetch_rows_queued"] + after["prefetch_rows_dropped"]
+            == after["prefetch_rows"]
+        )
+        assert after["prefetch_queue_depth"] == 64
+    finally:
+        monkeypatch.undo()
+        cache._index.close()
+
+
+def test_prefetch_source_failure_cancels_its_reservations_and_is_counted(monkeypatch):
+    """A failed warm read releases every slot, publishes no bytes, and is counted."""
+    cache = _cpu_row_cache()
+    cache._closed = False
+    untouched = np.array(cache._pool[0], copy=True)
+
+    def fail(ids, weights, scales, count):
+        raise IOError("injected prefetch read failure")
+
+    monkeypatch.setattr(cache, "_fetch", fail)
+    try:
+        cache._run_prefetch_job([1, 2])
+        snapshot = cache.stats()
+        assert snapshot["prefetch_rows_reserved"] == 2
+        assert snapshot["prefetch_rows_cancelled"] == 2
+        assert snapshot["prefetch_rows_loaded"] == 0
+        assert snapshot["prefetch_source_errors"] == 1
+        assert not cache._index.is_ready(1) and not cache._index.is_ready(2)
+        np.testing.assert_array_equal(cache._pool[0], untouched)
+    finally:
+        cache._index.close()
+
+
+def test_prefetch_loop_counts_jobs_and_the_errors_it_swallows():
+    """The worker counts every job it takes and every failure it hides."""
+    cache = _cpu_row_cache()
+    cache._closed = False
+    jobs = queue.Queue()
+    for job in ([1], [2], [3]):
+        jobs.put(job)
+    cache._prefetch_queue = jobs
+
+    def run(ids):
+        if ids == [2]:
+            raise IOError("injected job failure")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(cache, "_run_prefetch_job", run)
+    cache._prefetch_stop = False
+    worker = threading.Thread(target=cache._prefetch_loop)
+    try:
+        worker.start()
+        deadline = time.monotonic() + 3.0
+        while not jobs.empty() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert jobs.empty(), "the prefetch loop stopped early"
+        cache._prefetch_stop = True
+        worker.join(3)
+
+        snapshot = cache.stats()
+        assert snapshot["prefetch_jobs"] == 3
+        assert snapshot["prefetch_job_errors"] == 1
+    finally:
+        cache._prefetch_stop = True
+        if worker.is_alive():
+            worker.join(3)
+        monkeypatch.undo()
+        cache._index.close()
