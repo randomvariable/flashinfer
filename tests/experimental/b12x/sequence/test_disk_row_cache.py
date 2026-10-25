@@ -1008,12 +1008,15 @@ class _SaturatedQueue:
     """A prefetch queue that accepts nothing, as a worker falling behind looks."""
 
     def __init__(self, depth=64):
+        """Report ``depth`` pending jobs while refusing every insertion."""
         self.depth = depth
 
     def qsize(self):
+        """Pretend the queue is still this deep, as a stalled worker looks."""
         return self.depth
 
     def put_nowait(self, job):
+        """Reject every chunk, the way a full prefetch queue does."""
         raise queue.Full()
 
 
@@ -1061,6 +1064,7 @@ def test_prefetch_source_failure_cancels_its_reservations_and_is_counted(monkeyp
     untouched = np.array(cache._pool[0], copy=True)
 
     def fail(ids, weights, scales, count):
+        """Fail the warm read for any batch, as a dying source device would."""
         raise IOError("injected prefetch read failure")
 
     monkeypatch.setattr(cache, "_fetch", fail)
@@ -1087,6 +1091,7 @@ def test_prefetch_loop_counts_jobs_and_the_errors_it_swallows():
     cache._prefetch_queue = jobs
 
     def run(ids):
+        """Fail only on the second job, so one error lands among successes."""
         if ids == [2]:
             raise IOError("injected job failure")
 
