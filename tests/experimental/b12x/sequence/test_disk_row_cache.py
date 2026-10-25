@@ -825,6 +825,12 @@ def _cpu_row_cache():
     cache.ids_host = torch.zeros(2, dtype=torch.int64)
     cache.weight = torch.zeros((2, 3), dtype=torch.uint8)
     cache.scale = None
+    # What ``close`` inspects, so a test can drive a genuine shutdown here: no
+    # transaction in flight, nothing staged on device, and no mapped buffers.
+    cache._transaction_thread = None
+    cache._cache_used = False
+    cache._scale_allocation = None
+    cache._weight_allocation = None
     try:
         cache._index = S3FifoRowCache(
             8,
@@ -1172,3 +1178,50 @@ def test_prefetch_cancel_ignores_slots_adopted_elsewhere(monkeypatch):
         assert snapshot["prefetch_source_errors"] == 1
     finally:
         cache._index.close()
+
+
+def test_prefetch_losing_the_close_race_queues_nothing(monkeypatch):
+    """A close between normalization and enqueue must not return True.
+
+    The worker is stopped by then, so enqueued rows would sit unread forever
+    while the caller was told the request was accepted.
+    """
+    cache = _cpu_row_cache()
+    cache._closed = False
+    normalize = cache._normalize_prefetch_ids
+
+    def normalize_then_close(ids):
+        """Lose the cache to a close after the ids are accepted."""
+        job = normalize(ids)
+        cache.close()
+        return job
+
+    monkeypatch.setattr(cache, "_normalize_prefetch_ids", normalize_then_close)
+
+    assert cache.prefetch([1, 2, 3]) is False
+    assert cache._prefetch_requests == 0
+    assert cache._prefetch_queue is None or cache._prefetch_queue.qsize() == 0
+
+
+def test_worker_stays_quiet_when_close_wins_mid_fetch(monkeypatch):
+    """A job whose cache closes during ``_fetch`` must not log a job error.
+
+    The reservations died with the index, so releasing them again only raises
+    ``row cache is closed`` and miscounts the failure as a worker bug.
+    """
+    cache = _cpu_row_cache()
+    cache._closed = False
+
+    def fail_and_close(ids, weights, scales, count):
+        """Close the cache mid-read, as shutdown during a fetch looks."""
+        cache.close()
+        raise IOError("injected prefetch read failure")
+
+    monkeypatch.setattr(cache, "_fetch", fail_and_close)
+
+    cache._run_prefetch_job([1, 2])
+
+    assert cache._prefetch_job_errors == 0
+    assert cache._prefetch_source_errors == 1
+    assert cache._prefetch_rows_cancelled == 0
+    assert cache._prefetch_rows_loaded == 0

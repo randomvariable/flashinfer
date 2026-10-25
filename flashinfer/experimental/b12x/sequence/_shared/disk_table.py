@@ -647,6 +647,12 @@ class DiskRowCache:
         # queued-plus-dropped equals rows invariant would not hold across the
         # interleaving.
         with self._lock:
+            # Re-check the gate under the lock: ``close`` drops the index and
+            # stops the worker while holding it, so a close that wins after the
+            # check above would leave rows queued behind a dead worker while
+            # this still returned True.
+            if not self._prefetch_ok():
+                return False
             self._prefetch_requests += 1
             self._prefetch_rows += len(job)
             pending = self._prefetch_queue
@@ -813,12 +819,12 @@ class DiskRowCache:
             self._prefetch_source_errors += 1
         planes = [weight_np] + ([scale_np] if scale_np is not None else [])
         with self._lock:
-            if self._closed or self._row_cache_failed:
-                self._prefetch_rows_cancelled += self._cancel_reservations(
-                    index, reserved
-                )
+            if self._closed:
+                # ``close`` dropped the index, and with it every reservation:
+                # asking the closed cache to release them again would only
+                # raise, and the worker would log a spurious job error.
                 return
-            if not fetched:
+            if self._row_cache_failed or not fetched:
                 self._prefetch_rows_cancelled += self._cancel_reservations(
                     index, reserved
                 )
