@@ -447,12 +447,32 @@ class DiskRowCache:
         self._cache_done = torch.cuda.Event()
         self._cache_used = False
         self._closed = False
-        # Speculative PLE row prefetch. The worker thread and its bounded queue
-        # are created lazily on the first enabled ``prefetch`` so a disabled
-        # cache never spawns a thread; both stay ``None`` until then.
+        self._init_prefetch_state()
+
+    def _init_prefetch_state(self) -> None:
+        """Set the prefetch worker and its telemetry to their idle values.
+
+        The worker thread and its bounded queue are created lazily on the first
+        enabled ``prefetch`` so a disabled cache never spawns a thread; both
+        stay ``None`` until then. Each telemetry counter, published through
+        ``stats()``, is written by exactly one thread — the caller threads
+        before the job reaches the queue, the single worker thread after — so a
+        plain int increment is the whole synchronisation story.
+        """
         self._prefetch_thread: threading.Thread | None = None
         self._prefetch_queue: queue.Queue | None = None
         self._prefetch_stop = False
+        self._prefetch_requests = 0
+        self._prefetch_rows = 0
+        self._prefetch_rows_already_cached = 0
+        self._prefetch_rows_queued = 0
+        self._prefetch_rows_dropped = 0
+        self._prefetch_jobs = 0
+        self._prefetch_rows_reserved = 0
+        self._prefetch_rows_loaded = 0
+        self._prefetch_rows_cancelled = 0
+        self._prefetch_source_errors = 0
+        self._prefetch_job_errors = 0
 
     def _check_host_rows(self, host_rows):
         """Validate the host-resident source planes and return them as numpy views.
@@ -611,22 +631,29 @@ class DiskRowCache:
         GDS backend; otherwise ``True``. Calling it is the opt-in; there is no
         separate enable flag. ``ids`` may be a list of ints, a CPU int64 tensor,
         or a numpy array; duplicate, out-of-shard, and already-handled ids are
-        no-ops. When the queue is saturated the newest request is dropped.
+        no-ops. When the queue is saturated the newest request is dropped and
+        counted, so a prefetch that cannot keep up is visible rather than
+        silently discarded; see ``stats``.
         """
         if not self._prefetch_ok():
             return False
+        self._prefetch_requests += 1
         job = self._normalize_prefetch_ids(ids)
         if job is None:
             return False
+        self._prefetch_rows += len(job)
         if not job:
             return True
         self._ensure_prefetch_worker()
         if self._prefetch_queue is None:
             return True
         for start in range(0, len(job), self.max_lookups):
+            chunk = job[start : start + self.max_lookups]
             try:
-                self._prefetch_queue.put_nowait(job[start : start + self.max_lookups])
+                self._prefetch_queue.put_nowait(chunk)
+                self._prefetch_rows_queued += len(chunk)
             except queue.Full:
+                self._prefetch_rows_dropped += len(job) - start
                 break
         return True
 
@@ -693,6 +720,7 @@ class DiskRowCache:
                 if not low <= key < high:
                     continue
                 if index.is_ready(key):
+                    self._prefetch_rows_already_cached += 1
                     continue
                 result.append(key)
         return result
@@ -719,9 +747,9 @@ class DiskRowCache:
     def _prefetch_loop(self) -> None:
         """Drain the prefetch queue until stopped or handed the close sentinel.
 
-        Each job runs through ``_run_prefetch_job``; errors are swallowed
-        because prefetching is advisory and must never destabilize a caller
-        or the worker.
+        Each job runs through ``_run_prefetch_job``; errors are counted and
+        swallowed because prefetching is advisory and must never destabilize a
+        caller or the worker.
         """
         while not self._prefetch_stop:
             try:
@@ -730,12 +758,13 @@ class DiskRowCache:
                 continue
             if job is _PREFETCH_SENTINEL:
                 break
+            self._prefetch_jobs += 1
             try:
                 self._run_prefetch_job(job)
             except Exception:
                 # Prefetch is advisory: a source/transport error must never
                 # surface to, or destabilize, the caller or the worker.
-                pass
+                self._prefetch_job_errors += 1
 
     def _run_prefetch_job(self, ids) -> None:
         """Reserve loading slots for ``ids``, fetch their rows, and publish them.
@@ -759,6 +788,7 @@ class DiskRowCache:
         if not reserved:
             return
         count = len(reserved)
+        self._prefetch_rows_reserved += count
         weight_np = np.zeros((count, self.weight_row_bytes), dtype=np.uint8)
         scale_np = (
             np.zeros((count, self.scale_row_bytes), dtype=np.uint8)
@@ -776,15 +806,18 @@ class DiskRowCache:
             fetched = True
         except Exception:
             fetched = False
+            self._prefetch_source_errors += 1
         planes = [weight_np] + ([scale_np] if scale_np is not None else [])
         with self._lock:
             if self._closed or self._row_cache_failed:
                 for _, slot in reserved:
                     index.cancel(slot)
+                self._prefetch_rows_cancelled += count
                 return
             if not fetched:
                 for _, slot in reserved:
                     index.cancel(slot)
+                self._prefetch_rows_cancelled += count
                 return
             # Write the fetched bytes into the reserved
             # slots (skipping any the synchronous path already adopted or
@@ -798,6 +831,7 @@ class DiskRowCache:
                     pool[slot] = plane[row]
             for _, slot in reserved:
                 index.confirm(slot)
+            self._prefetch_rows_loaded += count
 
     def add_shard(
         self, shard_index: int, path: str, offset: int, *, scale: bool = False
@@ -1013,8 +1047,9 @@ class DiskRowCache:
         """Byte budgets plus backend and row-cache counters in one snapshot.
 
         Combines reader or GDS stats with this object's pinned and pool
-        allocations, and folds in the index hit/miss, residency, and
-        queue-depth counters when a row cache is active.
+        allocations, folds in the index hit/miss, residency, and queue-depth
+        counters when a row cache is active, and always carries the advisory
+        prefetch counters and the live prefetch queue depth.
         """
         self._require_open()
         with self._lock:
@@ -1083,4 +1118,22 @@ class DiskRowCache:
                     row_cache_main=index_stats["m"],
                     row_cache_ghost=index_stats["g"],
                 )
+            result.update(
+                prefetch_requests=self._prefetch_requests,
+                prefetch_rows=self._prefetch_rows,
+                prefetch_rows_already_cached=self._prefetch_rows_already_cached,
+                prefetch_rows_queued=self._prefetch_rows_queued,
+                prefetch_rows_dropped=self._prefetch_rows_dropped,
+                prefetch_jobs=self._prefetch_jobs,
+                prefetch_rows_reserved=self._prefetch_rows_reserved,
+                prefetch_rows_loaded=self._prefetch_rows_loaded,
+                prefetch_rows_cancelled=self._prefetch_rows_cancelled,
+                prefetch_source_errors=self._prefetch_source_errors,
+                prefetch_job_errors=self._prefetch_job_errors,
+                prefetch_queue_depth=(
+                    self._prefetch_queue.qsize() if self._prefetch_queue else 0
+                ),
+                prefetch_worker_started=int(self._prefetch_thread is not None),
+                prefetch_enabled=int(self._prefetch_ok()),
+            )
             return result
