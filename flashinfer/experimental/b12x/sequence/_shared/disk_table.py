@@ -454,10 +454,10 @@ class DiskRowCache:
 
         The worker thread and its bounded queue are created lazily on the first
         enabled ``prefetch`` so a disabled cache never spawns a thread; both
-        stay ``None`` until then. Each telemetry counter, published through
-        ``stats()``, is written by exactly one thread — the caller threads
-        before the job reaches the queue, the single worker thread after — so a
-        plain int increment is the whole synchronisation story.
+        stay ``None`` until then. Caller-side counters are updated under
+        ``_lock``, because ``prefetch`` is public and several model threads may
+        call it at once; the worker-side ones have the single prefetch worker as
+        their only writer, and ``stats`` reads them all under the same lock.
         """
         self._prefetch_thread: threading.Thread | None = None
         self._prefetch_queue: queue.Queue | None = None
@@ -637,24 +637,28 @@ class DiskRowCache:
         """
         if not self._prefetch_ok():
             return False
-        self._prefetch_requests += 1
         job = self._normalize_prefetch_ids(ids)
         if job is None:
             return False
-        self._prefetch_rows += len(job)
-        if not job:
-            return True
         self._ensure_prefetch_worker()
-        if self._prefetch_queue is None:
-            return True
-        for start in range(0, len(job), self.max_lookups):
-            chunk = job[start : start + self.max_lookups]
-            try:
-                self._prefetch_queue.put_nowait(chunk)
-                self._prefetch_rows_queued += len(chunk)
-            except queue.Full:
-                self._prefetch_rows_dropped += len(job) - start
-                break
+        # Counted under ``_lock``, the lock ``stats`` holds to read them:
+        # ``prefetch`` is public and more than one model thread may call it, so
+        # an unguarded read-modify-write could drop an increment, and the
+        # queued-plus-dropped equals rows invariant would not hold across the
+        # interleaving.
+        with self._lock:
+            self._prefetch_requests += 1
+            self._prefetch_rows += len(job)
+            pending = self._prefetch_queue
+            if job and pending is not None:
+                for start in range(0, len(job), self.max_lookups):
+                    chunk = job[start : start + self.max_lookups]
+                    try:
+                        pending.put_nowait(chunk)
+                        self._prefetch_rows_queued += len(chunk)
+                    except queue.Full:
+                        self._prefetch_rows_dropped += len(job) - start
+                        break
         return True
 
     def _prefetch_ok(self) -> bool:
@@ -785,10 +789,10 @@ class DiskRowCache:
                 slot = index.reserve(key)
                 if slot is not None:
                     reserved.append((key, slot))
+            self._prefetch_rows_reserved += len(reserved)
         if not reserved:
             return
         count = len(reserved)
-        self._prefetch_rows_reserved += count
         weight_np = np.zeros((count, self.weight_row_bytes), dtype=np.uint8)
         scale_np = (
             np.zeros((count, self.scale_row_bytes), dtype=np.uint8)
@@ -824,14 +828,18 @@ class DiskRowCache:
             # cancelled) and publish them, all under _lock. confirm() is
             # idempotent, so adopting a slot the batch already committed is a
             # no-op, exactly as with the Python index.
+            published = 0
             for row, (_, slot) in enumerate(reserved):
                 if not index.is_loading(slot):
                     continue
                 for plane, pool in zip(planes, self._pool):
                     pool[slot] = plane[row]
+                published += 1
             for _, slot in reserved:
                 index.confirm(slot)
-            self._prefetch_rows_loaded += count
+            # Only rows this worker actually wrote count as loaded: a slot the
+            # synchronous path adopted first is a hit someone else published.
+            self._prefetch_rows_loaded += published
 
     def add_shard(
         self, shard_index: int, path: str, offset: int, *, scale: bool = False
