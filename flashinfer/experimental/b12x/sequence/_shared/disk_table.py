@@ -814,14 +814,14 @@ class DiskRowCache:
         planes = [weight_np] + ([scale_np] if scale_np is not None else [])
         with self._lock:
             if self._closed or self._row_cache_failed:
-                for _, slot in reserved:
-                    index.cancel(slot)
-                self._prefetch_rows_cancelled += count
+                self._prefetch_rows_cancelled += self._cancel_reservations(
+                    index, reserved
+                )
                 return
             if not fetched:
-                for _, slot in reserved:
-                    index.cancel(slot)
-                self._prefetch_rows_cancelled += count
+                self._prefetch_rows_cancelled += self._cancel_reservations(
+                    index, reserved
+                )
                 return
             # Write the fetched bytes into the reserved
             # slots (skipping any the synchronous path already adopted or
@@ -840,6 +840,22 @@ class DiskRowCache:
             # Only rows this worker actually wrote count as loaded: a slot the
             # synchronous path adopted first is a hit someone else published.
             self._prefetch_rows_loaded += published
+
+    @staticmethod
+    def _cancel_reservations(index, reserved: list[tuple[int, int]]) -> int:
+        """Release every still-loading reservation and report how many fell to us.
+
+        A slot the synchronous path adopted or cancelled first is not ours to
+        release, so counting it would credit the prefetch worker with work it
+        never did — the same rule ``loaded`` follows.
+        """
+        cancelled = 0
+        for _, slot in reserved:
+            if not index.is_loading(slot):
+                continue
+            index.cancel(slot)
+            cancelled += 1
+        return cancelled
 
     def add_shard(
         self, shard_index: int, path: str, offset: int, *, scale: bool = False
