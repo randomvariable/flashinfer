@@ -1117,3 +1117,29 @@ def test_prefetch_loop_counts_jobs_and_the_errors_it_swallows():
             worker.join(3)
         monkeypatch.undo()
         cache._index.close()
+
+
+def test_prefetch_loaded_credits_only_rows_the_worker_published(monkeypatch):
+    """A slot the synchronous path adopted first is not prefetch's hit."""
+    cache = _cpu_row_cache()
+    cache._closed = False
+    index = cache._index
+    original = index.is_loading
+    asked: list[int] = []
+
+    def is_loading(slot):
+        """Answer the worker's adoption probe, once per reserved slot."""
+        asked.append(slot)
+        # Report every row but the first as already adopted by a sync read.
+        return original(slot) and len(asked) == 1
+
+    monkeypatch.setattr(index, "is_loading", is_loading)
+    try:
+        cache._run_prefetch_job([1, 2])
+        snapshot = cache.stats()
+        assert snapshot["prefetch_rows_reserved"] == 2
+        assert snapshot["prefetch_rows_loaded"] == 1
+        assert snapshot["prefetch_rows_cancelled"] == 0
+        assert snapshot["prefetch_source_errors"] == 0
+    finally:
+        cache._index.close()
