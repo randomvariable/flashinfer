@@ -1143,3 +1143,32 @@ def test_prefetch_loaded_credits_only_rows_the_worker_published(monkeypatch):
         assert snapshot["prefetch_source_errors"] == 0
     finally:
         cache._index.close()
+
+
+def test_prefetch_cancel_ignores_slots_adopted_elsewhere(monkeypatch):
+    """Rows the synchronous path took first are not cancellations by us."""
+    cache = _cpu_row_cache()
+    cache._closed = False
+    index = cache._index
+    original = index.is_loading
+    asked: list[int] = []
+
+    def is_loading(slot):
+        """Report only the first reservation as still ours to release."""
+        asked.append(slot)
+        return original(slot) and len(asked) == 1
+
+    def fail(ids, weights, scales, count):
+        """Fail the warm read so every reservation goes to the cancel path."""
+        raise IOError("injected prefetch read failure")
+
+    monkeypatch.setattr(index, "is_loading", is_loading)
+    monkeypatch.setattr(cache, "_fetch", fail)
+    try:
+        cache._run_prefetch_job([1, 2])
+        snapshot = cache.stats()
+        assert snapshot["prefetch_rows_reserved"] == 2
+        assert snapshot["prefetch_rows_cancelled"] == 1
+        assert snapshot["prefetch_source_errors"] == 1
+    finally:
+        cache._index.close()
