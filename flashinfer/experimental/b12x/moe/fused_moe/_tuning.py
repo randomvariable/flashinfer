@@ -748,14 +748,42 @@ def validate_moe_decode_config(
         raise ValueError("dynamic_route_mode is only valid for dynamic MoE")
 
 
-def _csf_default_config(query, config, device):
-    """Choose conservative SM120 scale and tile defaults from routing density."""
+def _csf_recipe_defaults_enabled(query, device):
+    """Whether this recipe and device have a measured default-policy entry.
+
+    This tests recipe capability and the measured execution contract, not the
+    final inline-scale decision.
+    """
     if (
         not query.csf_inline_scales
         or device is None
-        or device.compute_capability != (12, 0)
         or _compact_w4a8_query(query)
     ):
+        return False
+    if device.compute_capability == (12, 0):
+        # The complete existing SM120 policy domain.
+        return True
+    return bool(
+        device.compute_capability == (12, 1)
+        and device.sm_count == 48
+        and _nvfp4_query(query)
+        and query.source_format == "modelopt_nvfp4"
+        and query.activation == "silu"
+        and query.io_dtype == "bfloat16"
+        and query.shared_input_scales
+        and not query.deterministic_output
+        and not query.apply_router_weight_on_input
+        and not query.collect_activation_amax
+        and query.num_experts == 384
+        and query.hidden_size == 5120
+        and query.intermediate_size == 2304
+        and query.top_k == 6
+    )
+
+
+def _csf_backend_default_config(query, config, device):
+    """Apply the measured tiny-decode backend choice for a CSF recipe."""
+    if not _csf_recipe_defaults_enabled(query, device):
         return config
     nvfp4 = _nvfp4_query(query)
     if (
@@ -773,6 +801,14 @@ def _csf_default_config(query, config, device):
         )
         if _csf_inline_eligible(query, dynamic):
             config = dynamic
+    return config
+
+
+def _device_tile_default_config(query, config, device):
+    """Apply recipe-qualified tile tactics independently of inline execution."""
+    if not _csf_recipe_defaults_enabled(query, device):
+        return config
+    nvfp4 = _nvfp4_query(query)
     if (
         config.backend == "dynamic"
         and query.controls.get("dynamic_tile_mn") is None
@@ -785,6 +821,10 @@ def _csf_default_config(query, config, device):
             materialized = replace(config, dynamic_tile_m=128)
             if (
                 rows >= 48 * experts
+                # The early M128 promotion is an RTX split-materialization
+                # crossover, not an inline-scale tactic. GB10 keeps native M64
+                # until the native 96E ladder chooses M128 on its own.
+                and device.compute_capability == (12, 0)
                 and _nvfp4_materialization_eligible(query, materialized)
                 and query.controls.get("dynamic_nvfp4_materialized") is not False
             ):
@@ -792,6 +832,13 @@ def _csf_default_config(query, config, device):
         elif query.quant_mode == "w4a8_mx" and config.dynamic_tile_m == 16:
             if rows >= 16 * experts:
                 config = replace(config, dynamic_tile_m=32)
+    return config
+
+
+def _csf_default_config(query, config, device):
+    """Choose inline scales for the already-selected backend and tile."""
+    if not _csf_recipe_defaults_enabled(query, device):
+        return config
     # Expansion amortizes repeated decoding at high expert occupancy; tiny
     # launches and compact N64 kernels retain expansion as their default.
     min_tokens = 8 if query.quant_mode == "w4a8_mx" else 16
@@ -831,6 +878,8 @@ def _default_config(
             and query.shared_input_scales
         ),
     )
+    config = _csf_backend_default_config(query, config, device)
+    config = _device_tile_default_config(query, config, device)
     config = _csf_default_config(query, config, device)
     config = replace(
         config,
