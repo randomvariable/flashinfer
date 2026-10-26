@@ -235,6 +235,40 @@ def _dsv4_spark_short_gather_num_splits(
     return None
 
 
+def _dsv41_spark_default_num_splits(
+    *,
+    rows: int,
+    heads: int,
+    topk: int,
+    extra_topk: int,
+    swa_page_size: int,
+    indexed_page_size: int | None,
+    compute_mode: str,
+    sm_count: int | None,
+    compute_capability: tuple[int, int] | None,
+    workspace_splits: int,
+) -> int:
+    """Keep the measured GB10 BF16 split policy separate from V4's producer."""
+    if (
+        compute_capability == (12, 1)
+        and sm_count == 48
+        and heads == 64
+        and topk == 128
+        and extra_topk == 512
+        and swa_page_size == 128
+        and indexed_page_size == 128
+        and compute_mode == "bf16"
+        and rows in {7, 13, 14}
+        and workspace_splits >= 10
+    ):
+        # Three splits wins across short and long live lengths. Four is faster
+        # at row 7 with a full gather, but loses at tiny contexts; row 4 also
+        # needs length-dependent tuning, so neither gets that unconditional
+        # promotion. Smaller prepared workspace choices remain authoritative.
+        return 3
+    return workspace_splits
+
+
 def _wave_balanced_num_splits(
     *, num_chunks: int, per_token_head: int, sm_count: int
 ) -> int:
@@ -2612,7 +2646,22 @@ def prepare_unified_decode_launch(
     extra_topk = int(indexed_indices.shape[1]) if has_extra else 0
     max_chunks = int(workspace.max_chunks_per_row)
     if traits.model_type == ModelType.DSV41 and forced_num_splits is None:
-        forced_num_splits = int(workspace.num_chunks_value)
+        forced_num_splits = _dsv41_spark_default_num_splits(
+            rows=rows,
+            heads=heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            swa_page_size=swa_page_size,
+            indexed_page_size=indexed_page_size,
+            compute_mode=v41_compute_mode,
+            sm_count=sm_count,
+            compute_capability=(
+                torch.cuda.get_device_capability(q_all.device)
+                if sm_count == 48 and q_all.is_cuda
+                else None
+            ),
+            workspace_splits=int(workspace.num_chunks_value),
+        )
     dsv4_h16_allowed = bool(
         int(traits.model_type) == int(ModelType.DSV4)
         and heads % 16 == 0
@@ -2988,13 +3037,28 @@ def run_unified_decode(
         num_main_chunks = (topk + _CAND_WINDOW - 1) // _CAND_WINDOW
         num_extra_chunks = (extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
         max_chunks = int(workspace.max_chunks_per_row)
-        if model_type == ModelType.DSV41 and forced_num_splits is None:
-            forced_num_splits = int(workspace.num_chunks_value)
         sm_count = (
             int(torch.cuda.get_device_properties(q_all.device).multi_processor_count)
             if q_all.is_cuda
             else None
         )
+        if model_type == ModelType.DSV41 and forced_num_splits is None:
+            forced_num_splits = _dsv41_spark_default_num_splits(
+                rows=rows,
+                heads=heads,
+                topk=topk,
+                extra_topk=extra_topk,
+                swa_page_size=swa_page_size,
+                indexed_page_size=indexed_page_size,
+                compute_mode=v41_compute_mode,
+                sm_count=sm_count,
+                compute_capability=(
+                    torch.cuda.get_device_capability(q_all.device)
+                    if sm_count == 48 and q_all.is_cuda
+                    else None
+                ),
+                workspace_splits=int(workspace.num_chunks_value),
+            )
         h16_allowed = bool(
             int(model_type) == int(ModelType.DSV4)
             and heads % 16 == 0
