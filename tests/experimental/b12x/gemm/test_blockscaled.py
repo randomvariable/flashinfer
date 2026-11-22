@@ -46,6 +46,21 @@ def test_regime_plan_combines_static_shapes_with_dynamic_capacity() -> None:
     }
 
 
+def test_q8_mm_accepts_regime_plan() -> None:
+    require_b12x()
+    source = torch.ones((2, 256), device="cuda", dtype=torch.bfloat16)
+    raw = torch.ones((64, 8, 34), device="cuda", dtype=torch.uint8)
+    raw[..., 0] = 0
+    raw[..., 1] = 60  # FP16 scale 1.0, followed by 32 int8 values of 1.
+    weight = blockscaled.pack_weight(raw, recipe="q8_0")
+    query = blockscaled.query_from_call(source, weight)
+    plan = blockscaled.plan_regimes(query, exact_m=(1,))
+
+    torch.testing.assert_close(
+        blockscaled.mm(source, weight, plan=plan), source.new_full((2, 64), 256)
+    )
+
+
 @pytest.mark.parametrize("workspace_form", ["provided", "owned"])
 @pytest.mark.parametrize("n,k", [(2560, 2560), (2560, 6144), (6144, 2560)])
 def test_mxfp8_capacity_lowering_keeps_prefill_tile_hint(workspace_form, n, k):

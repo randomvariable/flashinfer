@@ -1040,10 +1040,15 @@ def blockscaled_mm(
 
             if _overlap(out, bias):
                 raise ValueError("out must not overlap bias")
+        # Regime variants share the activation layout of the capacity query.
+        shape_plan = plan
+        if plan is not None and not isinstance(plan, Plan):
+            shape_plan = plan.variants[plan.capacity_metadata["max_rows"]]
         source_width = rhs.in_features * (
             2
-            if plan is not None
-            and getattr(plan.query, "source_activation", "identity") == "swiglu_bf16"
+            if shape_plan is not None
+            and getattr(shape_plan.query, "source_activation", "identity")
+            == "swiglu_bf16"
             else 1
         )
         if lhs.shape[-1] != source_width:
