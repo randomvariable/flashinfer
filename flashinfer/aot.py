@@ -1290,7 +1290,17 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
-        if has_sm90 or has_sm100 or has_sm103 or has_sm107:
+        # The autotuner loads this arch-generic delay kernel on every arch it
+        # tunes, so leaving an arch out makes it JIT-compile at startup.
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm103
+            or has_sm107
+            or has_sm110
+            or has_sm120
+            or has_sm121
+        ):
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
