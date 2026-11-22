@@ -1286,7 +1286,9 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     ],
     backend: Literal["sparse", "cake"] = "sparse",
     enable_pdl: Optional[bool] = None,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if bmm2_scale != 1.0:
         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
     cake = backend == "cake"
@@ -1483,38 +1485,32 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             )
         )
 
-    result = cast(
-        torch.Tensor,
-        _trtllm_batch_decode_sparse_mla_sm120(
-            query=query_for_sm120,
-            kv_cache=swa_kv_cache,
-            workspace_buffer=workspace_buffer,
-            sparse_mla_segments=sparse_mla_segments,
-            out=out_for_sm120,
-            sm_scale=bmm1_scale,
-            sinks=sinks,
-            lse=None,
-            return_lse=False,
-            lse_scale=lse_scale,
-            # The V4.1 forms select the DSV4_1 model types (32-wide UE8M0
-            # groups) in the SM120 runner: DSV4_1 for the footer-scale pages,
-            # DSV4_1_INLINE for the inline-scale records; 'fp8' stays on the
-            # DSV4 default.
-            kv_scale_format=(
-                "ue8m0_g32_inline"
-                if kv_cache_format in _DSV41_INLINE_KV_CACHE_FORMATS
-                else "ue8m0_g32"
-                if kv_cache_format in _DSV41_KV_CACHE_FORMATS
-                else "auto"
-            ),
-            kv_cache_format=kv_cache_format,
-            backend=backend,
-            enable_pdl=enable_pdl,
+    result = _trtllm_batch_decode_sparse_mla_sm120(
+        query=query_for_sm120,
+        kv_cache=swa_kv_cache,
+        workspace_buffer=workspace_buffer,
+        sparse_mla_segments=sparse_mla_segments,
+        out=out_for_sm120,
+        sm_scale=bmm1_scale,
+        sinks=sinks,
+        lse=lse,
+        return_lse=return_lse,
+        lse_scale=lse_scale,
+        kv_scale_format=(
+            "ue8m0_g32_inline"
+            if kv_cache_format in _DSV41_INLINE_KV_CACHE_FORMATS
+            else "ue8m0_g32"
+            if kv_cache_format in _DSV41_KV_CACHE_FORMATS
+            else "auto"
         ),
+        kv_cache_format=kv_cache_format,
+        backend=backend,
+        enable_pdl=enable_pdl,
     )
-    if query.ndim == 3:
-        return result.squeeze(1)
-    return result
+    if isinstance(result, tuple):
+        output, output_lse = result
+        return (output.squeeze(1) if query.ndim == 3 else output), output_lse
+    return result.squeeze(1) if query.ndim == 3 else result
 
 
 _DSV4_HCA_WINDOW_CAPACITY = 128
@@ -1852,6 +1848,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     sparse_topk_lens_offset: int = 0,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     *,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
     kv_cache_format: Literal[
         "fp8",
         "nvfp4",
@@ -2168,6 +2166,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         launches and CUDA-graph replays. When ``None`` (default) a fresh buffer
         is allocated per call, which is not CUDA-graph friendly. Only used by
         ``backend="trtllm-gen"``.
+    return_lse : bool
+        With ``backend="sparse"``, return ``(out, lse)`` with natural-log
+        float32 log-sum-exp in flattened query-token order.
+    lse : Optional[torch.Tensor]
+        Caller-owned float32 output of shape ``[sum_q, num_heads]``.
+        Requires ``return_lse=True``.
     kv_cache_format : {"fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca", "fp8_dsv41_inline", "fp8_dsv41_inline_fp4_ca"}
         SM120/SM121 sparse-cache storage format. ``"fp8"`` preserves the
         existing 584-byte DSv4 cache ABI. ``"fp8_dsv41"`` selects the
@@ -2215,6 +2219,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     _check_dsv4_kv_cache_format_backend(
         kv_cache_format, backend, sm120_cake=_is_sm120_family(query.device)
     )
+
+    if return_lse and backend != "sparse":
+        raise ValueError("DSv4 sparse MLA return_lse requires backend='sparse'")
+    if lse is not None and not return_lse:
+        raise ValueError("lse requires return_lse=True")
 
     rope_quant = dsv4_inv_rope_cos_sin_cache is not None
     if dsv4_output_scale is not None and not rope_quant:
@@ -2437,12 +2446,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             out=out,
             bmm1_scale=float(bmm1_scale),
             bmm2_scale=float(bmm2_scale),
-            lse_scale=1.0,
+            lse_scale=1.0 / log2e if return_lse else 1.0,
             sinks=sinks,
             kv_layout=kv_layout,
             kv_cache_format=kv_cache_format,
             backend="cake" if cake_sm120 else "sparse",
             enable_pdl=enable_pdl if cake_sm120 else None,
+            lse=lse,
+            return_lse=return_lse,
         )
 
     if backend == "cake" and kv_cache_format == "nvfp4":

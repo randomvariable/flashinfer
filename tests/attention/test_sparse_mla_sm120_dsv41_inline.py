@@ -644,6 +644,49 @@ def test_dsv4_entry_inline_formats_match_footer(fp4, sm12x):
     assert torch.equal(out, ref)
 
 
+def test_inline_partial_lse_reconstructs_full_attention(sm12x):
+    """Merge partials over disjoint cache segments, including an empty owner."""
+    swa, extra = _caches("fp4", 64, 64, seed=3)
+    swa = _footer_to_inline(swa, *_FP8)
+    extra = _footer_to_inline(extra, *_FP4)
+    torch.manual_seed(5)
+    q = torch.randn(2, 1, 16, 512, device="cuda", dtype=torch.bfloat16) / 10
+    indices = (
+        torch.arange(128, device="cuda", dtype=torch.int32).expand(2, -1).contiguous()
+    )
+    lse = torch.empty((2, 16), device="cuda", dtype=torch.float32)
+
+    def run(swa_lengths, extra_lengths, **kwargs):
+        return flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q,
+            swa_kv_cache=swa,
+            workspace_buffer=torch.empty(1, dtype=torch.int8, device="cuda"),
+            sparse_indices=indices,
+            compressed_kv_cache=extra,
+            swa_topk_lens=torch.tensor(swa_lengths, device="cuda", dtype=torch.int32),
+            extra_sparse_indices=indices,
+            extra_sparse_topk_lens=torch.tensor(
+                extra_lengths, device="cuda", dtype=torch.int32
+            ),
+            bmm1_scale=512**-0.5,
+            kv_layout="NHD",
+            kv_cache_format="fp8_dsv41_inline_fp4_ca",
+            **kwargs,
+        )
+
+    ref = run([128, 128], [73, 0])
+    a, a_lse = run([128, 128], [0, 0], return_lse=True, lse=lse)
+    b, b_lse = run([0, 0], [73, 0], return_lse=True)
+    assert a_lse is lse
+    assert torch.isneginf(b_lse[1]).all()
+    weights = torch.stack((a_lse, b_lse)).softmax(dim=0)
+    merged = (
+        a.float() * weights[0, :, None, :, None]
+        + b.float() * weights[1, :, None, :, None]
+    )
+    torch.testing.assert_close(merged, ref.float(), atol=0.01, rtol=0.03)
+
+
 def test_cake_rejects_inline_formats(sm12x):
     with pytest.raises(ValueError, match="inline"):
         flashinfer.mla.SparseMLASm120Wrapper(
